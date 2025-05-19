@@ -2,6 +2,7 @@
 DROP TABLE IF EXISTS public.subscriptions CASCADE;
 DROP TABLE IF EXISTS public.invites CASCADE;
 DROP TABLE IF EXISTS public.users CASCADE;
+DROP TABLE IF EXISTS public.products CASCADE;
 DROP TABLE IF EXISTS public.tenants CASCADE;
 
 -- Drop existing functions
@@ -51,6 +52,23 @@ CREATE TABLE IF NOT EXISTS public.tenants (
     DEFERRABLE INITIALLY DEFERRED
 );
 
+-- Products Table
+CREATE TABLE IF NOT EXISTS public.products (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT,
+  price DECIMAL(10,2) NOT NULL,
+  product_commission DECIMAL(5,2), -- Commission percentage (0-100)
+  image_url TEXT,
+  is_active BOOLEAN DEFAULT true,
+  created_by UUID NOT NULL REFERENCES auth.users(id),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  
+  CONSTRAINT valid_commission CHECK (product_commission >= 0 AND product_commission <= 100)
+);
+
 -- Create tenant function with proper permissions
 CREATE OR REPLACE FUNCTION public.create_tenant(
   p_name TEXT,
@@ -95,11 +113,15 @@ CREATE TABLE IF NOT EXISTS public.users (
   id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   email TEXT NOT NULL,
   role TEXT NOT NULL,
-  tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+  tenant_id UUID NOT NULL,
   invited_by UUID REFERENCES auth.users(id),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   
-  CONSTRAINT valid_role CHECK (role IN ('admin', 'affiliate'))
+  CONSTRAINT valid_role CHECK (role IN ('admin', 'affiliate')),
+  CONSTRAINT users_tenant_id_fkey FOREIGN KEY (tenant_id) 
+    REFERENCES public.tenants(id) 
+    ON DELETE CASCADE
+    DEFERRABLE INITIALLY DEFERRED
 );
 
 -- Invites Table
@@ -287,4 +309,117 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 CREATE TRIGGER on_tenant_created
   AFTER INSERT ON public.tenants
   FOR EACH ROW
-  EXECUTE PROCEDURE public.handle_new_tenant(); 
+  EXECUTE PROCEDURE public.handle_new_tenant();
+
+-- Products Table Policies
+CREATE POLICY products_select_policy ON public.products
+  FOR SELECT USING (
+    auth.uid() IN (
+      SELECT id FROM public.users WHERE tenant_id = public.products.tenant_id
+    )
+  );
+
+CREATE POLICY products_insert_policy ON public.products
+  FOR INSERT WITH CHECK (
+    auth.uid() IN (
+      SELECT id FROM public.users WHERE role = 'admin' AND tenant_id = public.products.tenant_id
+    )
+  );
+
+CREATE POLICY products_update_policy ON public.products
+  FOR UPDATE USING (
+    auth.uid() IN (
+      SELECT id FROM public.users WHERE role = 'admin' AND tenant_id = public.products.tenant_id
+    )
+  );
+
+CREATE POLICY products_delete_policy ON public.products
+  FOR DELETE USING (
+    auth.uid() IN (
+      SELECT id FROM public.users WHERE role = 'admin' AND tenant_id = public.products.tenant_id
+    )
+  );
+
+-- Enable RLS on products table
+ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
+
+-- Seed initial data (insert tenant, user, then products)
+
+-- Insert the tenant
+INSERT INTO public.tenants (
+  id, name, plan, trial_start, trial_end, created_by
+) VALUES (
+  '192c5392-fba1-494b-8d1d-e63e3473c1bf',
+  'Demo Company',
+  'trial',
+  NOW(),
+  NOW() + INTERVAL '14 days',
+  '61d010de-46cd-4112-8f1a-685af2c64f18'
+);
+
+-- Insert the user
+INSERT INTO public.users (
+  id, email, role, tenant_id, created_at
+) VALUES (
+  '61d010de-46cd-4112-8f1a-685af2c64f18',
+  'geervani825@gmail.com',
+  'admin',
+  '192c5392-fba1-494b-8d1d-e63e3473c1bf',
+  NOW()
+);
+
+-- Insert products
+INSERT INTO public.products (
+  tenant_id,
+  name,
+  description,
+  price,
+  product_commission,
+  image_url,
+  created_by
+) VALUES 
+  (
+    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
+    'Premium Course Bundle',
+    'Complete package of all our premium courses including advanced marketing strategies and business development.',
+    299.99,
+    15.00,
+    'https://example.com/images/premium-bundle.jpg',
+    '61d010de-46cd-4112-8f1a-685af2c64f18'
+  ),
+  (
+    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
+    'Marketing Masterclass',
+    'Learn advanced digital marketing techniques and strategies.',
+    149.99,
+    20.00,
+    'https://example.com/images/marketing-masterclass.jpg',
+    '61d010de-46cd-4112-8f1a-685af2c64f18'
+  ),
+  (
+    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
+    'Business Growth Toolkit',
+    'Essential tools and resources for scaling your business.',
+    199.99,
+    25.00,
+    'https://example.com/images/business-toolkit.jpg',
+    '61d010de-46cd-4112-8f1a-685af2c64f18'
+  ),
+  (
+    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
+    'SEO Optimization Guide',
+    'Comprehensive guide to improve your website''s search engine rankings.',
+    79.99,
+    10.00,
+    'https://example.com/images/seo-guide.jpg',
+    '61d010de-46cd-4112-8f1a-685af2c64f18'
+  ),
+  (
+    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
+    'Social Media Strategy Pack',
+    'Complete social media marketing strategy and content calendar.',
+    129.99,
+    15.00,
+    'https://example.com/images/social-media-pack.jpg',
+    '61d010de-46cd-4112-8f1a-685af2c64f18'
+  ); 

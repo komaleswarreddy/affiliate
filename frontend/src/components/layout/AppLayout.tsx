@@ -8,6 +8,7 @@ interface AppLayoutProps {
 const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
   const sidebarItems = [
     { name: 'Dashboard', path: '/dashboard' },
+    { name: 'Products', path: '/products' },
     { 
       name: 'Affiliate Management', 
       path: '#',

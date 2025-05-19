@@ -4,6 +4,7 @@ import jwt from '@fastify/jwt';
 import { authRoutes } from './routes/auth';
 import { tenantRoutes } from './routes/tenants';
 import { userRoutes } from './routes/users';
+import { productRoutes } from './routes/products';
 import { config } from './config';
 
 const server = Fastify({
@@ -27,6 +28,7 @@ server.register(jwt, {
 server.register(authRoutes, { prefix: '/api/auth' });
 server.register(tenantRoutes, { prefix: '/api/tenants' });
 server.register(userRoutes, { prefix: '/api/users' });
+server.register(productRoutes, { prefix: '/api' });
 
 // Health check route
 server.get('/health', async () => {

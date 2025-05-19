@@ -5,6 +5,7 @@ import { ProtectedRoute } from './components/auth/ProtectedRoute';
 import { SignupForm } from './components/auth/SignupForm';
 import { LoginForm } from './components/auth/LoginForm';
 import { Dashboard } from './pages/Dashboard';
+import { ProductsPage } from './pages/ProductsPage';
 import AppLayout from './components/layout/AppLayout';
 import './index.css';
 
@@ -49,6 +50,16 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
             <ProtectedRoute>
               <AppLayout>
                 <Dashboard />
+              </AppLayout>
+            </ProtectedRoute>
+          } 
+        />
+        <Route 
+          path="/products" 
+          element={
+            <ProtectedRoute>
+              <AppLayout>
+                <ProductsPage />
               </AppLayout>
             </ProtectedRoute>
           } 
