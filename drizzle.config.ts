@@ -7,9 +7,12 @@ dotenv.config();
 // Determine whether to use PostgreSQL or SQLite
 const usePostgres = process.env.USE_POSTGRES === 'true';
 
+// Create configuration based on database type
+let config;
+
 if (usePostgres) {
   // PostgreSQL configuration
-  export default defineConfig({
+  config = defineConfig({
     schema: './src/server/db/schema.ts',
     out: './drizzle/migrations',
     driver: 'pg',
@@ -21,7 +24,7 @@ if (usePostgres) {
   });
 } else {
   // SQLite configuration
-  export default defineConfig({
+  config = defineConfig({
     schema: './src/server/db/schema.ts',
     out: './drizzle/migrations-sqlite',
     driver: 'better-sqlite',
@@ -32,3 +35,6 @@ if (usePostgres) {
     strict: true,
   });
 } 
+
+// Single export at the end
+export default config; 

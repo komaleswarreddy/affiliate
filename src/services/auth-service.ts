@@ -288,49 +288,6 @@ export class AuthService {
       logDebug('Registration failed:', error);
       throw error;
     }
-  });
-    
-    const url = `${this.fullApiUrl}/register`;
-    logDebug('Registration URL:', url);
-    
-    try {
-      // Log full request data for debugging (excluding password)
-      const debugData = {
-        ...userData,
-        password: '********',
-        confirmPassword: userData.confirmPassword ? '********' : undefined
-      };
-      logDebug('Sending registration data:', debugData);
-      
-      const response: AxiosResponse<AuthResponse> = await this.axiosInstance.post(
-        url,
-        userData
-      );
-      
-      logDebug('Registration successful');
-      return response.data;
-    } catch (error: any) {
-      // Enhanced error logging
-      if (error.response) {
-        // The request was made and the server responded with an error status
-        logDebug('Registration server error:', {
-          status: error.response.status,
-          data: error.response.data,
-          headers: error.response.headers
-        });
-      } else if (error.request) {
-        // The request was made but no response was received (network error)
-        logDebug('Registration network error - no response received:', {
-          request: error.request
-        });
-      } else {
-        // Something happened in setting up the request
-        logDebug('Registration error:', error.message);
-      }
-      
-      logDebug('Registration failed:', error);
-      throw error;
-    }
   }
 
   /**
