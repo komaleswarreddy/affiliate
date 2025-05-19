@@ -4,8 +4,35 @@ DROP TABLE IF EXISTS public.invites CASCADE;
 DROP TABLE IF EXISTS public.users CASCADE;
 DROP TABLE IF EXISTS public.tenants CASCADE;
 
+-- Drop existing functions
+DROP FUNCTION IF EXISTS public.create_tenant CASCADE;
+DROP FUNCTION IF EXISTS public.handle_new_tenant CASCADE;
+DROP FUNCTION IF EXISTS public.verify_auth_user CASCADE;
+
 -- Enable UUID extension if not already enabled
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Function to verify auth user exists
+CREATE OR REPLACE FUNCTION public.verify_auth_user(p_user_id UUID)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user_id UUID;
+BEGIN
+  SELECT id INTO v_user_id
+  FROM auth.users
+  WHERE id = p_user_id;
+
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'User with ID % does not exist', p_user_id;
+  END IF;
+
+  RETURN v_user_id;
+END;
+$$;
 
 -- Tenants Table
 CREATE TABLE IF NOT EXISTS public.tenants (
@@ -14,11 +41,54 @@ CREATE TABLE IF NOT EXISTS public.tenants (
   plan TEXT NOT NULL DEFAULT 'trial',
   trial_start TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
   trial_end TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (NOW() + INTERVAL '14 days'),
-  created_by UUID NOT NULL REFERENCES auth.users(id),
+  created_by UUID NOT NULL,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   
-  CONSTRAINT valid_plan CHECK (plan IN ('trial', 'starter', 'pro', 'enterprise'))
+  CONSTRAINT valid_plan CHECK (plan IN ('trial', 'starter', 'pro', 'enterprise')),
+  CONSTRAINT tenants_created_by_fkey FOREIGN KEY (created_by) 
+    REFERENCES auth.users(id) 
+    ON DELETE CASCADE
+    DEFERRABLE INITIALLY DEFERRED
 );
+
+-- Create tenant function with proper permissions
+CREATE OR REPLACE FUNCTION public.create_tenant(
+  p_name TEXT,
+  p_created_by UUID,
+  p_plan TEXT DEFAULT 'trial',
+  p_trial_start TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  p_trial_end TIMESTAMP WITH TIME ZONE DEFAULT (NOW() + INTERVAL '14 days')
+)
+RETURNS public.tenants
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_tenant public.tenants;
+BEGIN
+  -- First verify the user exists using the verify_auth_user function
+  PERFORM public.verify_auth_user(p_created_by);
+
+  -- Insert the tenant
+  INSERT INTO public.tenants (
+    name,
+    plan,
+    trial_start,
+    trial_end,
+    created_by
+  ) VALUES (
+    p_name,
+    p_plan,
+    p_trial_start,
+    p_trial_end,
+    p_created_by
+  )
+  RETURNING * INTO v_tenant;
+
+  RETURN v_tenant;
+END;
+$$;
 
 -- Extended User Profiles Table
 CREATE TABLE IF NOT EXISTS public.users (

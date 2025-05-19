@@ -14,9 +14,12 @@
     "@fastify/swagger": "^8.12.1",
     "@fastify/type-provider-typebox": "^3.6.0",
     "@supabase/supabase-js": "^2.39.7",
+    "@types/nodemailer": "^6.4.17",
     "bcryptjs": "^2.4.3",
     "dotenv": "^16.4.5",
     "fastify": "^4.24.3",
+    "nanoid": "^5.1.5",
+    "nodemailer": "^7.0.3",
     "zod": "^3.22.4"
   },
   "devDependencies": {
@@ -25,4 +28,4 @@
     "tsx": "^4.7.1",
     "typescript": "^5.2.2"
   }
-} 
+}

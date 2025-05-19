@@ -8,4 +8,5 @@ export const config = {
   jwtSecret: process.env.JWT_SECRET || 'your-secret-key',
   supabaseUrl: process.env.SUPABASE_URL || '',
   supabaseAnonKey: process.env.SUPABASE_ANON_KEY || '',
+  supabaseServiceKey: process.env.SUPABASE_SERVICE_KEY || '',
 } as const; 

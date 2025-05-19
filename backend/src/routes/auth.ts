@@ -5,7 +5,9 @@ import { createClient } from '@supabase/supabase-js';
 import { config } from '../config';
 import type { JWTPayload, User, Tenant } from '../types';
 
+// Create two clients - one for auth operations and one for service role operations
 const supabase = createClient(config.supabaseUrl, config.supabaseAnonKey);
+const supabaseAdmin = createClient(config.supabaseUrl, config.supabaseServiceKey);
 
 // Validation schemas
 const signupSchema = z.object({
@@ -73,7 +75,31 @@ export async function authRoutes(fastify: FastifyInstance) {
         throw new Error('Auth user creation succeeded but no user data returned');
       }
 
-      request.log.info('Auth user created successfully:', { userId: authUser.user.id });
+      request.log.info('Auth user created successfully:', { 
+        userId: authUser.user.id,
+        email: authUser.user.email,
+        metadata: authUser.user.user_metadata
+      });
+
+      // Wait a short moment to ensure the auth user is fully created
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Verify the user exists in auth.users using RPC
+      const { data: verifyUser, error: verifyError } = await supabase
+        .rpc('verify_auth_user', {
+          p_user_id: authUser.user.id
+        });
+
+      if (verifyError || !verifyUser) {
+        request.log.error('Failed to verify auth user:', { 
+          error: verifyError,
+          userId: authUser.user.id
+        });
+        await supabase.auth.admin.deleteUser(authUser.user.id);
+        throw new Error('Failed to verify auth user creation');
+      }
+
+      request.log.info('Verified auth user exists:', { userId: verifyUser.id });
 
       // Create tenant with the user's ID
       const tenantData = {
@@ -86,11 +112,12 @@ export async function authRoutes(fastify: FastifyInstance) {
       
       request.log.info('Creating tenant with data:', tenantData);
 
+      // Use RPC function to create tenant with proper permissions
       const { data: tenant, error: tenantError } = await supabase
-        .from('tenants')
-        .insert([tenantData])
-        .select()
-        .single();
+        .rpc('create_tenant', {
+          p_name: data.companyName,
+          p_created_by: authUser.user.id
+        });
 
       if (tenantError) {
         request.log.error('Tenant creation error:', {
@@ -98,8 +125,11 @@ export async function authRoutes(fastify: FastifyInstance) {
           code: tenantError.code,
           message: tenantError.message,
           details: tenantError.details,
-          hint: tenantError.hint
+          hint: tenantError.hint,
+          userId: authUser.user.id
         });
+        // If tenant creation fails, we should clean up the auth user
+        await supabase.auth.admin.deleteUser(authUser.user.id);
         throw new Error(`Failed to create tenant: ${tenantError.message}`);
       }
 
@@ -134,6 +164,9 @@ export async function authRoutes(fastify: FastifyInstance) {
           details: userError.details,
           hint: userError.hint
         });
+        // Clean up both auth user and tenant if user creation fails
+        await supabase.auth.admin.deleteUser(authUser.user.id);
+        await supabase.from('tenants').delete().eq('id', tenant.id);
         throw new Error(`Failed to create public user: ${userError.message}`);
       }
 
