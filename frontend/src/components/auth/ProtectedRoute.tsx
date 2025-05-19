@@ -15,40 +15,46 @@ export function ProtectedRoute({
   allowedRoles = [],
   requireAuth = true,
 }: ProtectedRouteProps) {
-  const { isAuthenticated, role, refreshUser, user } = useAuthStore();
+  const { isAuthenticated, role, refreshUser, user, token } = useAuthStore();
   const [isLoading, setIsLoading] = useState(true);
   const location = useLocation();
 
   useEffect(() => {
     const checkAuth = async () => {
-      if (user && requireAuth) {
+      // If authentication is required and user is not authenticated but has a token,
+      // try to refresh user data from the token.
+      if (requireAuth && !isAuthenticated && token) {
         await refreshUser();
       }
       setIsLoading(false);
     };
 
     checkAuth();
-  }, [refreshUser, user, requireAuth]);
+  }, [isAuthenticated, refreshUser, requireAuth, token]); // Depend on isAuthenticated and token
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
-      </div>
-    );
+    // Only show loading if authentication is required and we are not authenticated yet.
+    // Otherwise, render immediately (e.g., public routes).
+    if (requireAuth && !isAuthenticated) {
+       return (
+        <div className="flex items-center justify-center min-h-screen">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
+        </div>
+      );
+    }
   }
 
-  // Not authenticated, redirect to login
+  // Not authenticated, redirect to login if auth is required
   if (requireAuth && !isAuthenticated) {
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
 
-  // Already authenticated but accessing login/signup pages
+  // Already authenticated but accessing login/signup pages (if auth is not required)
   if (!requireAuth && isAuthenticated) {
     return <Navigate to="/dashboard" replace />;
   }
 
-  // Check role-based access if roles are specified
+  // Check role-based access if roles are specified and auth is required
   if (
     requireAuth &&
     isAuthenticated &&
@@ -60,6 +66,6 @@ export function ProtectedRoute({
     return <Navigate to="/unauthorized" replace />;
   }
 
-  // All checks passed, render the protected component
+  // All checks passed, render the protected component or public component
   return <>{children}</>;
 } 

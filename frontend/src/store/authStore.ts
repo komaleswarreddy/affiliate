@@ -1,6 +1,5 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { supabase } from '../lib/supabase';
 import type { User } from '@supabase/supabase-js';
 
 export type UserRole = 'admin' | 'affiliate';
@@ -19,6 +18,7 @@ export interface AuthState {
   tenant: Tenant | null;
   isLoading: boolean;
   isAuthenticated: boolean;
+  token: string | null;
   
   // Methods
   loginWithEmail: (email: string, password: string) => Promise<{ error: Error | null }>;
@@ -35,6 +35,8 @@ export interface AuthState {
   getTenantDetails: () => Promise<void>;
 }
 
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api';
+
 export const useAuthStore = create<AuthState>()(
   persist(
     (set, get) => ({
@@ -43,26 +45,34 @@ export const useAuthStore = create<AuthState>()(
       tenant: null,
       isLoading: false,
       isAuthenticated: false,
+      token: null,
 
       loginWithEmail: async (email, password) => {
         set({ isLoading: true });
         
         try {
-          const { data, error } = await supabase.auth.signInWithPassword({
-            email,
-            password,
+          const response = await fetch(`${API_URL}/auth/login`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ email, password }),
           });
 
-          if (error) throw error;
+          const data = await response.json();
+
+          if (!response.ok) {
+            throw new Error(data.error || 'Login failed');
+          }
 
           set({ 
             user: data.user,
-            isAuthenticated: !!data.user,
+            role: data.user.role,
+            token: data.token,
+            isAuthenticated: true,
             isLoading: false,
           });
 
-          // Get user role and tenant info
-          await get().refreshUser();
           await get().getTenantDetails();
 
           return { error: null };
@@ -72,59 +82,41 @@ export const useAuthStore = create<AuthState>()(
         }
       },
 
-      signupWithEmail: async (email, password, fullName, companyName, _websiteUrl, _phoneNumber) => {
+      signupWithEmail: async (email, password, fullName, companyName, websiteUrl, phoneNumber) => {
         set({ isLoading: true });
         
         try {
-          // Step 1: Sign up with Supabase Auth
-          const { data: authData, error: authError } = await supabase.auth.signUp({
-            email,
-            password,
-            options: {
-              data: {
-                full_name: fullName,
-              },
+          const response = await fetch(`${API_URL}/auth/signup`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
             },
+            body: JSON.stringify({
+              email,
+              password,
+              fullName,
+              companyName,
+              websiteUrl,
+              phoneNumber,
+            }),
+          });
+          console.log(response);
+
+          const data = await response.json();
+
+          if (!response.ok) {
+            throw new Error(data.error || 'Signup failed');
+          }
+
+          set({ 
+            user: data.user,
+            role: data.user.role,
+            token: data.token,
+            isAuthenticated: true,
+            isLoading: false,
           });
 
-          if (authError) throw authError;
-          
-          if (authData.user) {
-            // Step 2: Create a new tenant
-            const { data: tenantData, error: tenantError } = await supabase
-              .from('tenants')
-              .insert({
-                name: companyName,
-                plan: 'trial',
-                trial_start: new Date().toISOString(),
-                trial_end: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(), // 14 days trial
-                created_by: authData.user.id,
-              })
-              .select()
-              .single();
-
-            if (tenantError) throw tenantError;
-
-            // Step 3: Create extended user profile with admin role
-            const { error: profileError } = await supabase
-              .from('users')
-              .insert({
-                id: authData.user.id,
-                email,
-                role: 'admin',
-                tenant_id: tenantData.id,
-              });
-
-            if (profileError) throw profileError;
-            
-            set({ 
-              user: authData.user,
-              role: 'admin',
-              tenant: tenantData as Tenant,
-              isAuthenticated: true,
-              isLoading: false,
-            });
-          }
+          await get().getTenantDetails();
 
           return { error: null };
         } catch (error) {
@@ -134,59 +126,73 @@ export const useAuthStore = create<AuthState>()(
       },
 
       logout: async () => {
-        await supabase.auth.signOut();
         set({ 
           user: null, 
           role: null, 
           tenant: null,
           isAuthenticated: false,
+          token: null,
         });
       },
 
       refreshUser: async () => {
-        const { data } = await supabase.auth.getUser();
+        const { token } = get();
         
-        if (data.user) {
-          set({ user: data.user, isAuthenticated: true });
-          
-          // Get user role
-          const { data: userData } = await supabase
-            .from('users')
-            .select('role, tenant_id')
-            .eq('id', data.user.id)
-            .single();
-          
-          if (userData) {
+        if (!token) return;
+
+        try {
+          const response = await fetch(`${API_URL}/users/me`, {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+            },
+          });
+
+          const data = await response.json();
+
+          if (response.ok) {
             set({ 
-              role: userData.role as UserRole, 
+              user: data.user,
+              role: data.user.role,
+              isAuthenticated: true,
+            });
+          } else {
+            set({ 
+              user: null,
+              role: null,
+              isAuthenticated: false,
+              token: null,
             });
           }
+        } catch (error) {
+          console.error('Error refreshing user:', error);
+          set({ 
+            user: null,
+            role: null,
+            isAuthenticated: false,
+            token: null,
+          });
         }
       },
 
       getTenantDetails: async () => {
-        const { user, role } = get();
+        const { token } = get();
         
-        if (!user || !role) return;
+        if (!token) return;
         
-        // Get tenant ID from user profile
-        const { data: userData } = await supabase
-          .from('users')
-          .select('tenant_id')
-          .eq('id', user.id)
-          .single();
-        
-        if (userData?.tenant_id) {
-          // Get tenant details
-          const { data: tenantData } = await supabase
-            .from('tenants')
-            .select('*')
-            .eq('id', userData.tenant_id)
-            .single();
-          
-          if (tenantData) {
-            set({ tenant: tenantData as Tenant });
+        try {
+          const response = await fetch(`${API_URL}/tenants/me`, {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+            },
+          });
+
+          const data = await response.json();
+
+          if (response.ok) {
+            set({ tenant: data.tenant });
           }
+        } catch (error) {
+          console.error('Error fetching tenant details:', error);
         }
       },
     }),
@@ -197,6 +203,7 @@ export const useAuthStore = create<AuthState>()(
         role: state.role, 
         tenant: state.tenant,
         isAuthenticated: state.isAuthenticated,
+        token: state.token,
       }),
     }
   )

@@ -1,3 +1,12 @@
+-- Drop existing tables in reverse order of dependencies
+DROP TABLE IF EXISTS public.subscriptions CASCADE;
+DROP TABLE IF EXISTS public.invites CASCADE;
+DROP TABLE IF EXISTS public.users CASCADE;
+DROP TABLE IF EXISTS public.tenants CASCADE;
+
+-- Enable UUID extension if not already enabled
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 -- Tenants Table
 CREATE TABLE IF NOT EXISTS public.tenants (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -5,7 +14,7 @@ CREATE TABLE IF NOT EXISTS public.tenants (
   plan TEXT NOT NULL DEFAULT 'trial',
   trial_start TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
   trial_end TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (NOW() + INTERVAL '14 days'),
-  created_by UUID NOT NULL,
+  created_by UUID NOT NULL REFERENCES auth.users(id),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   
   CONSTRAINT valid_plan CHECK (plan IN ('trial', 'starter', 'pro', 'enterprise'))
