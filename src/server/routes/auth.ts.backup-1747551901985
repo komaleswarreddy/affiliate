@@ -1,0 +1,635 @@
+import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
+import { db } from '../db';
+import { users, tenants, passwordResetTokens, roles } from '../db/schema';
+import { eq, and, sql } from 'drizzle-orm';
+import { PgTable } from 'drizzle-orm/pg-core';
+import { hashPassword, comparePasswords } from '../utils/password';
+import { TRIAL_PERIOD_DAYS } from '../../lib/constants';
+import { generateUUID } from '../utils/uuid';
+import { isDevelopment } from '../../lib/utils';
+
+// Define schemas for validation
+const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  tenant: z.string(),
+});
+
+const registerSchema = z.object({
+  firstName: z.string().min(1),
+  lastName: z.string().min(1),
+  email: z.string().email(),
+  password: z.string()
+    .min(8)
+    .regex(/[A-Z]/, { message: 'Password must contain at least one uppercase letter' })
+    .regex(/[a-z]/, { message: 'Password must contain at least one lowercase letter' })
+    .regex(/[0-9]/, { message: 'Password must contain at least one number' })
+    .regex(/[^A-Za-z0-9]/, { message: 'Password must contain at least one special character' }),
+  confirmPassword: z.string().min(1),
+  companyName: z.string().min(1),
+  tenant: z.string().min(1).regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/, {
+    message: 'Subdomain can only contain lowercase letters, numbers, and hyphens. It cannot start or end with a hyphen.',
+  }),
+  acceptTerms: z.boolean().refine((val) => val === true, {
+    message: 'You must accept the terms and conditions',
+  }),
+}).refine((data) => data.password === data.confirmPassword, {
+  message: 'Passwords do not match',
+  path: ['confirmPassword']
+});
+
+const forgotPasswordSchema = z.object({
+  email: z.string().email(),
+  tenant: z.string(),
+});
+
+const resetPasswordSchema = z.object({
+  password: z.string().min(8),
+  token: z.string(),
+});
+
+const verifyTokenSchema = z.object({
+  token: z.string(),
+});
+
+// Helper function to generate JWT token
+const generateToken = (payload: any) => {
+  const jwtSecret = process.env.JWT_SECRET;
+  if (!jwtSecret) {
+    throw new Error('JWT_SECRET environment variable is not set. Please set it in your .env file.');
+  }
+  return jwt.sign(
+    payload,
+    jwtSecret,
+    { expiresIn: '24h' }
+  );
+};
+
+export const authRoutes = async (server: FastifyInstance) => {
+  // Login endpoint
+  server.post('/login', async (request, reply) => {
+    try {
+      // Validate input
+      try {
+        const body = loginSchema.parse(request.body);
+        
+        // Continue with login process...
+        // Check email format
+        if (!body.email.includes('@')) {
+          return reply.code(400).send({ 
+            error: 'Invalid email format',
+            field: 'email',
+            message: 'Please provide a valid email address with @ character'
+          });
+        }
+      } catch (validationError) {
+        // Handle validation errors with detailed messages
+        if (validationError instanceof z.ZodError) {
+          const errors = validationError.errors.map(err => ({
+            field: err.path.join('.'),
+            message: err.message
+          }));
+          
+          return reply.code(400).send({
+            error: 'Validation failed',
+            details: errors
+          });
+        }
+        throw validationError;
+      }
+      
+      const body = loginSchema.parse(request.body);
+      
+      // Get tenant ID from subdomain
+      const normalizedTenant = body.tenant.toLowerCase();
+      
+      // First find all tenants with matching subdomain (case-insensitive)
+      const tenantsResult = await db
+        .select()
+        .from(tenants)
+        .where(
+          // Use direct string comparison
+          eq(sql`LOWER(${tenants.subdomain})`, normalizedTenant)
+        )
+        .limit(1);
+
+      if (tenantsResult.length === 0) {
+        return reply.code(401).send({ error: 'Invalid tenant or credentials' });
+      }
+
+      const tenant = tenantsResult[0];
+
+      // Find user in the specified tenant
+      const [user] = await db
+        .select()
+        .from(users)
+        .where(
+          and(
+            // Case-insensitive email comparison
+            sql`LOWER(${users.email}) = ${body.email.toLowerCase()}`,
+            eq(users.tenantId, tenant.id)
+          )
+        )
+        .limit(1);
+
+      if (!user) {
+        return reply.code(401).send({ error: 'Invalid credentials' });
+      }
+
+      // Verify password
+      const isPasswordValid = await comparePasswords(body.password, user.password);
+      if (!isPasswordValid) {
+        return reply.code(401).send({ error: 'Invalid credentials' });
+      }
+      
+      // Get user roles and permissions
+      let userRoles = ['user'];
+      let userPermissions: string[] = [];
+      
+      if (user.roleId) {
+        const [userRole] = await db
+          .select()
+          .from(roles)
+          .where(eq(roles.id, user.roleId))
+          .limit(1);
+          
+        if (userRole) {
+          userRoles = [userRole.name];
+          
+          // Safely handle permissions with better error checking
+          try {
+            // First try to parse as JSON if it's a string
+            if (typeof userRole.permissions === 'string') {
+              try {
+                const parsedPermissions = JSON.parse(userRole.permissions);
+                if (Array.isArray(parsedPermissions)) {
+                  userPermissions = parsedPermissions;
+                } else if (typeof parsedPermissions === 'object' && parsedPermissions !== null) {
+                  // If it's an object, extract values as an array
+                  userPermissions = Object.values(parsedPermissions)
+                    .filter(item => typeof item === 'string');
+                } else {
+                  userPermissions = [];
+                  server.log.warn('Unexpected permissions format (not an array or object):', userRole.permissions);
+                }
+              } catch (parseError) {
+                server.log.error('Error parsing permissions JSON:', parseError);
+                userPermissions = [];
+              }
+            }
+            // Handle if it's already an array
+            else if (Array.isArray(userRole.permissions)) {
+              userPermissions = userRole.permissions;
+            }
+            // Default to empty permissions if invalid format
+            else {
+              userPermissions = [];
+              server.log.warn('Unexpected permissions format:', typeof userRole.permissions);
+            }
+          } catch (error) {
+            server.log.error('Error handling permissions:', error);
+            userPermissions = [];
+          }
+        }
+      }
+      
+      // Generate JWT
+      const token = generateToken({ 
+        userId: user.id,
+        tenantId: user.tenantId,
+        email: user.email,
+        roles: userRoles,
+        permissions: userPermissions
+      });
+
+      // Return token and user data
+      return { 
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          tenantId: user.tenantId,
+          roles: userRoles,
+          permissions: userPermissions
+        }
+      };
+    } catch (error) {
+      // Enhanced error logging
+      server.log.error('Login error details:', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        stack: error instanceof Error ? error.stack : undefined,
+        body: request.body
+      });
+      
+      // Structured error response
+      return reply.code(error instanceof z.ZodError ? 400 : 500).send({ 
+        error: error instanceof Error ? error.message : 'An error occurred during login',
+        success: false,
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+
+  // Register endpoint
+  server.post('/register', async (request, reply) => {
+    try {
+      // Type the request body for better type safety
+      const requestBody = request.body as Record<string, unknown>;
+      
+      // Log incoming registration request for debugging
+      server.log.debug('Registration request received:', {
+        body: JSON.stringify(requestBody),
+        headers: request.headers
+      });
+      
+      // Check if all required fields are present
+      const requiredFields = ['firstName', 'lastName', 'email', 'password', 'confirmPassword', 'tenant', 'companyName', 'acceptTerms'];
+      const missingFields = requiredFields.filter(field => !(field in requestBody));
+      
+      if (missingFields.length > 0) {
+        server.log.error('Missing required fields:', missingFields);
+        return reply.code(400).send({
+          error: `Missing required fields: ${missingFields.join(', ')}`,
+          details: missingFields.map(field => ({ field, message: 'This field is required' }))
+        });
+      }
+      
+      // Detailed validation with better error handling
+      try {
+        const body = registerSchema.parse(request.body);
+        server.log.debug('Validation passed for registration data');
+      } catch (validationError) {
+        // Handle validation errors with detailed messages
+        if (validationError instanceof z.ZodError) {
+          const errors = validationError.errors.map(err => ({
+            field: err.path.join('.'),
+            message: err.message
+          }));
+          
+          server.log.error('Registration validation failed:', JSON.stringify(errors));
+          
+          return reply.code(400).send({
+            error: 'Validation failed',
+            details: errors
+          });
+        }
+        throw validationError;
+      }
+      
+      const body = registerSchema.parse(request.body);
+      
+      // Validate subdomain format
+      if (!/^[a-z0-9-]+$/.test(body.tenant)) {
+        server.log.debug('Invalid subdomain format:', body.tenant);
+        return reply.code(400).send({ 
+          error: 'Subdomain can only contain lowercase letters, numbers, and hyphens'
+        });
+      }
+      
+      // Check if tenant already exists
+      const existingTenant = await db
+        .select()
+        .from(tenants)
+        .where(eq(tenants.subdomain, body.tenant))
+        .limit(1);
+
+      if (existingTenant.length > 0) {
+        server.log.debug('Subdomain already in use:', body.tenant);
+        return reply.code(400).send({ error: 'Subdomain already in use' });
+      }
+      
+      // Check if email is already in use (in any tenant)
+      const existingUser = await db
+        .select()
+        .from(users)
+        .where(eq(users.email, body.email))
+        .limit(1);
+        
+      if (existingUser.length > 0) {
+        server.log.debug('Email already in use:', body.email);
+        return reply.code(400).send({ error: 'Email already in use' });
+      }
+
+      // Create the tenant with trial status
+      const trialExpiry = new Date();
+      trialExpiry.setDate(trialExpiry.getDate() + TRIAL_PERIOD_DAYS);
+      
+      // Generate secure UUIDs for all entities
+      const tenantId = generateUUID();
+      const roleId = generateUUID();
+      const userId = generateUUID();
+      
+      server.log.info(`Creating tenant with ID: ${tenantId}`);
+      
+      try {
+        // Pre-insert validation logging
+        console.log('=== PRE-INSERT VALIDATION ===');
+        console.log('Tenant ID:', tenantId);
+        console.log('Role ID:', roleId);
+        console.log('User ID:', userId);
+        console.log('Tenant values:', {
+          id: tenantId,
+          name: body.companyName,
+          subdomain: body.tenant,
+          subscriptionTier: 'trial',
+          settings: '{}' // string for SQLite
+        });
+        console.log('Role values:', {
+          id: roleId,
+          tenantId: tenantId,
+          name: 'admin',
+          permissions: process.env.USE_POSTGRES === 'true' ? ['*'] : JSON.stringify(['*']),
+        });
+        console.log('=== END VALIDATION ===');
+      
+        // Step 1: Insert tenant - with dedicated try/catch
+        try {
+          console.log('Inserting tenant...');
+          await db.insert(tenants).values({
+            id: tenantId,
+            name: body.companyName,
+            subdomain: body.tenant,
+            subscriptionTier: 'trial',
+            expiresAt: trialExpiry,
+            // Initialize settings as a stringified empty object for SQLite compatibility
+            settings: '{}'
+          });
+          console.log('Tenant inserted successfully');
+        } catch (tenantError: unknown) {
+          console.error('ERROR inserting tenant:', tenantError);
+          throw new Error(`Tenant insertion failed: ${tenantError instanceof Error ? tenantError.message : 'Unknown error'}`);
+        }
+        
+        // Step 2: Insert admin role - with dedicated try/catch
+        try {
+          console.log('Inserting role...');
+          server.log.info(`Creating admin role with ID: ${roleId}`);
+          
+          // Insert admin role
+          await db.insert(roles).values({
+            id: roleId,
+            tenantId: tenantId,
+            name: 'admin',
+            description: 'Administrator with full access',
+            // Handle permissions based on the database type
+            // For SQLite, we need to stringify the array
+            permissions: process.env.USE_POSTGRES === 'true' ? ['*'] : JSON.stringify(['*']),
+            isCustom: false,
+            createdBy: 'system'
+          });
+          console.log('Role inserted successfully');
+        } catch (roleError: unknown) {
+          console.error('ERROR inserting role:', roleError);
+          throw new Error(`Role insertion failed: ${roleError instanceof Error ? roleError.message : 'Unknown error'}`);
+        }
+        
+        // Step 3: Hash password and insert user - with dedicated try/catch
+        try {
+          console.log('Hashing password...');
+          server.log.info(`Hashing password for user with ID: ${userId}`);
+          
+          // Hash the password
+          const hashedPassword = await hashPassword(body.password);
+          console.log('Password hashed successfully, length:', hashedPassword.length);
+          
+          console.log('Inserting user...');
+          // Insert the user with admin role
+          await db.insert(users).values({
+            id: userId,
+            tenantId: tenantId,
+            email: body.email,
+            password: hashedPassword,
+            firstName: body.firstName,
+            lastName: body.lastName,
+            roleId: roleId,
+            // SQLite uses integers (0/1) for booleans
+            termsAccepted: process.env.USE_POSTGRES === 'true' ? true : 1,
+            // Ensure we're providing values for required fields
+            marketingConsent: process.env.USE_POSTGRES === 'true' ? false : 0,
+            isAffiliate: process.env.USE_POSTGRES === 'true' ? false : 0
+          });
+          console.log('User inserted successfully');
+          server.log.info(`User registered successfully: ${body.email}`);
+        } catch (userError: unknown) {
+          console.error('ERROR inserting user:', userError);
+          throw new Error(`User insertion failed: ${userError instanceof Error ? userError.message : 'Unknown error'}`);
+        }
+        
+        // Generate JWT token
+        const token = generateToken({
+          userId: userId,
+          tenantId: tenantId,
+          email: body.email,
+          roles: ['admin'],
+          permissions: ['*']
+        });
+        
+        // Return token and user data
+        return {
+          token,
+          user: {
+            id: userId,
+            email: body.email,
+            firstName: body.firstName,
+            lastName: body.lastName,
+            tenantId: tenantId,
+            roles: ['admin'],
+            permissions: ['*']
+          }
+        };
+      } catch (error) {
+        server.log.error('Database error during registration:', error);
+        
+        // Enhanced error logging with detailed stack trace and full error inspection
+        console.error('=== REGISTRATION ERROR DETAILS ===');
+        console.error('Error object:', error);
+        if (error instanceof Error) {
+          console.error('Error message:', error.message);
+          console.error('Error stack:', error.stack);
+          console.error('Error name:', error.name);
+          // Log all properties of the error
+          console.error('Error properties:', Object.getOwnPropertyNames(error).reduce((obj, prop) => {
+            obj[prop] = (error as any)[prop];
+            return obj;
+          }, {} as any));
+        }
+        console.error('================================');
+        
+        // Improved error message for database errors
+        let errorMessage = 'Failed to create account. Please try again later.';
+        
+        // If it's a SQLite error, it might contain more specific info about column constraints
+        if (error instanceof Error) {
+          if (error.message.includes('UNIQUE constraint failed')) {
+            if (error.message.includes('tenants.subdomain')) {
+              errorMessage = 'This subdomain is already in use. Please choose another one.';
+            } else if (error.message.includes('users.email')) {
+              errorMessage = 'This email is already registered. Please use a different email.';
+            }
+          } else if (error.message.includes('no such column')) {
+            server.log.error('Database schema error:', {
+              message: error.message,
+              stack: error.stack
+            });
+            errorMessage = 'Database configuration error. Please contact support.';
+          } else if (error.message.includes('foreign key constraint failed')) {
+            errorMessage = 'Database integrity error: Foreign key constraint failed.';
+          }
+        }
+        
+        return reply.code(500).send({
+          error: errorMessage
+        });
+      }
+    } catch (error) {
+      server.log.error('Registration error:', error);
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : 'An error occurred during registration'
+      });
+    }
+  });
+
+  // Forgot password endpoint
+  server.post('/forgot-password', async (request, reply) => {
+    try {
+      const body = forgotPasswordSchema.parse(request.body);
+      
+      // Find the tenant
+      const [tenant] = await db
+        .select()
+        .from(tenants)
+        .where(eq(tenants.subdomain, body.tenant))
+        .limit(1);
+        
+      if (!tenant) {
+        // Do not reveal if tenant exists or not for security
+        return { success: true };
+      }
+      
+      // Find the user
+      const [user] = await db
+        .select()
+        .from(users)
+        .where(
+          and(
+            eq(users.email, body.email),
+            eq(users.tenantId, tenant.id)
+          )
+        )
+        .limit(1);
+        
+      if (!user) {
+        // Do not reveal if user exists or not for security
+        return { success: true };
+      }
+      
+      // Generate a secure reset token
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenId = generateUUID();
+      
+      // Set expiry to 1 hour from now
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + 1);
+      
+      // Store token in database
+      await db.insert(passwordResetTokens).values({
+        id: tokenId,
+        userId: user.id,
+        token: token,
+        expiresAt: expiresAt
+      });
+      
+      // In a real application, send email with reset link
+      // For development, log the token
+      if (isDevelopment) {
+        console.log(`Password reset token for ${user.email}: ${token}`);
+      }
+      
+      return { success: true };
+    } catch (error) {
+      server.log.error(error);
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : 'An error occurred'
+      });
+    }
+  });
+
+  // Reset password endpoint
+  server.post('/reset-password', async (request, reply) => {
+    try {
+      const body = resetPasswordSchema.parse(request.body);
+      
+      // Find the reset token
+      const [resetToken] = await db
+        .select()
+        .from(passwordResetTokens)
+        .where(eq(passwordResetTokens.token, body.token))
+        .limit(1);
+        
+      if (!resetToken) {
+        return reply.code(400).send({ error: 'Invalid or expired token' });
+      }
+      
+      // Check if token is expired
+      const now = new Date();
+      if (resetToken.expiresAt < now) {
+        // Delete expired token
+        await db
+          .delete(passwordResetTokens)
+          .where(eq(passwordResetTokens.id, resetToken.id));
+          
+        return reply.code(400).send({ error: 'Token has expired' });
+      }
+      
+      // Hash the new password
+      const hashedPassword = await hashPassword(body.password);
+      
+      // Update user's password
+      await db
+        .update(users)
+        .set({ password: hashedPassword })
+        .where(eq(users.id, resetToken.userId));
+        
+      // Delete the used token
+      await db
+        .delete(passwordResetTokens)
+        .where(eq(passwordResetTokens.id, resetToken.id));
+        
+      return { success: true };
+    } catch (error) {
+      server.log.error(error);
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : 'An error occurred'
+      });
+    }
+  });
+
+  // Verify token endpoint
+  server.post('/verify-token', async (request, reply) => {
+    try {
+      const body = verifyTokenSchema.parse(request.body);
+      
+      try {
+        const jwtSecret = process.env.JWT_SECRET;
+        if (!jwtSecret) {
+          throw new Error('JWT_SECRET environment variable is not set');
+        }
+        
+        jwt.verify(body.token, jwtSecret);
+        return { valid: true };
+      } catch (error) {
+        return { valid: false };
+      }
+    } catch (error) {
+      server.log.error(error);
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : 'An error occurred'
+      });
+    }
+  });
+};
