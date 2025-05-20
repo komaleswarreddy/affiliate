@@ -4,36 +4,35 @@ DROP TABLE IF EXISTS public.invites CASCADE;
 DROP TABLE IF EXISTS public.users CASCADE;
 DROP TABLE IF EXISTS public.products CASCADE;
 DROP TABLE IF EXISTS public.tenants CASCADE;
+DROP TABLE IF EXISTS public.affiliates CASCADE;
+DROP TABLE IF EXISTS public.commission_tiers CASCADE;
 
 -- Drop existing functions
 DROP FUNCTION IF EXISTS public.create_tenant CASCADE;
 DROP FUNCTION IF EXISTS public.handle_new_tenant CASCADE;
 DROP FUNCTION IF EXISTS public.verify_auth_user CASCADE;
+DROP FUNCTION IF EXISTS public.handle_invite_acceptance CASCADE;
 
 -- Enable UUID extension if not already enabled
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Function to verify auth user exists
-CREATE OR REPLACE FUNCTION public.verify_auth_user(p_user_id UUID)
-RETURNS UUID
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = public
-AS $$
-DECLARE
-  v_user_id UUID;
-BEGIN
-  SELECT id INTO v_user_id
-  FROM auth.users
-  WHERE id = p_user_id;
+-- Commission Tiers Table
+CREATE TABLE IF NOT EXISTS public.commission_tiers (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name TEXT NOT NULL,
+  commission_rate DECIMAL(5,2) NOT NULL,
+  description TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  
+  CONSTRAINT valid_commission_rate CHECK (commission_rate >= 0 AND commission_rate <= 100)
+);
 
-  IF v_user_id IS NULL THEN
-    RAISE EXCEPTION 'User with ID % does not exist', p_user_id;
-  END IF;
-
-  RETURN v_user_id;
-END;
-$$;
+-- Insert default commission tiers
+INSERT INTO public.commission_tiers (name, commission_rate, description) VALUES
+  ('Bronze', 5.00, 'Entry level tier'),
+  ('Silver', 10.00, 'Intermediate tier'),
+  ('Gold', 15.00, 'Advanced tier'),
+  ('Platinum', 20.00, 'Premium tier');
 
 -- Tenants Table
 CREATE TABLE IF NOT EXISTS public.tenants (
@@ -68,6 +67,90 @@ CREATE TABLE IF NOT EXISTS public.products (
   
   CONSTRAINT valid_commission CHECK (product_commission >= 0 AND product_commission <= 100)
 );
+
+-- Extended User Profiles Table
+CREATE TABLE IF NOT EXISTS public.users (
+  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  role TEXT NOT NULL,
+  tenant_id UUID NOT NULL,
+  invited_by UUID REFERENCES auth.users(id),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  
+  CONSTRAINT valid_role CHECK (role IN ('admin', 'affiliate')),
+  CONSTRAINT users_tenant_id_fkey FOREIGN KEY (tenant_id) 
+    REFERENCES public.tenants(id) 
+    ON DELETE CASCADE
+    DEFERRABLE INITIALLY DEFERRED
+);
+
+-- Affiliates Table
+CREATE TABLE IF NOT EXISTS public.affiliates (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+  commission_tier_id UUID NOT NULL REFERENCES public.commission_tiers(id),
+  total_earnings DECIMAL(10,2) DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  
+  CONSTRAINT valid_status CHECK (status IN ('active', 'inactive', 'suspended')),
+  CONSTRAINT unique_user_tenant UNIQUE (user_id, tenant_id)
+);
+
+-- Invites Table
+CREATE TABLE IF NOT EXISTS public.invites (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  email TEXT NOT NULL,
+  tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+  product_id UUID NOT NULL REFERENCES public.products(id) ON DELETE CASCADE,
+  role TEXT NOT NULL DEFAULT 'affiliate',
+  created_by UUID NOT NULL REFERENCES auth.users(id),
+  status TEXT NOT NULL DEFAULT 'pending',
+  accepted_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  
+  CONSTRAINT valid_role CHECK (role IN ('affiliate')),
+  CONSTRAINT valid_status CHECK (status IN ('pending', 'accepted', 'rejected'))
+);
+
+-- Subscriptions Table
+CREATE TABLE IF NOT EXISTS public.subscriptions (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+  plan TEXT NOT NULL,
+  status TEXT NOT NULL,
+  start_date TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  end_date TIMESTAMP WITH TIME ZONE,
+  is_trial BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  
+  CONSTRAINT valid_plan CHECK (plan IN ('trial', 'starter', 'pro', 'enterprise')),
+  CONSTRAINT valid_status CHECK (status IN ('trial', 'active', 'canceled'))
+);
+
+-- Function to verify auth user exists
+CREATE OR REPLACE FUNCTION public.verify_auth_user(p_user_id UUID)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user_id UUID;
+BEGIN
+  SELECT id INTO v_user_id
+  FROM auth.users
+  WHERE id = p_user_id;
+
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'User with ID % does not exist', p_user_id;
+  END IF;
+
+  RETURN v_user_id;
+END;
+$$;
 
 -- Create tenant function with proper permissions
 CREATE OR REPLACE FUNCTION public.create_tenant(
@@ -108,57 +191,72 @@ BEGIN
 END;
 $$;
 
--- Extended User Profiles Table
-CREATE TABLE IF NOT EXISTS public.users (
-  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  email TEXT NOT NULL,
-  role TEXT NOT NULL,
-  tenant_id UUID NOT NULL,
-  invited_by UUID REFERENCES auth.users(id),
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+-- Function to handle invite acceptance
+CREATE OR REPLACE FUNCTION public.handle_invite_acceptance()
+RETURNS TRIGGER AS $$
+DECLARE
+  v_bronze_tier_id UUID;
+  v_user_id UUID;
+BEGIN
+  -- Only proceed if status is being changed to 'accepted'
+  IF NEW.status = 'accepted' AND OLD.status != 'accepted' THEN
+    -- Get bronze tier ID
+    SELECT id INTO v_bronze_tier_id FROM public.commission_tiers WHERE name = 'Bronze';
+    
+    -- Create auth user and get the ID
+    INSERT INTO auth.users (email, encrypted_password)
+    VALUES (NEW.email, crypt(NEW.email, gen_salt('bf')))
+    RETURNING id INTO v_user_id;
+    
+    -- Create user profile
+    INSERT INTO public.users (id, email, role, tenant_id, invited_by)
+    VALUES (v_user_id, NEW.email, 'affiliate', NEW.tenant_id, NEW.created_by);
+    
+    -- Create affiliate record
+    INSERT INTO public.affiliates (user_id, tenant_id, commission_tier_id)
+    VALUES (v_user_id, NEW.tenant_id, v_bronze_tier_id);
+    
+    -- Update accepted_at timestamp
+    NEW.accepted_at = NOW();
+  END IF;
   
-  CONSTRAINT valid_role CHECK (role IN ('admin', 'affiliate')),
-  CONSTRAINT users_tenant_id_fkey FOREIGN KEY (tenant_id) 
-    REFERENCES public.tenants(id) 
-    ON DELETE CASCADE
-    DEFERRABLE INITIALLY DEFERRED
-);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Invites Table
-CREATE TABLE IF NOT EXISTS public.invites (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  email TEXT NOT NULL,
-  tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
-  role TEXT NOT NULL DEFAULT 'affiliate',
-  created_by UUID NOT NULL REFERENCES auth.users(id),
-  accepted_at TIMESTAMP WITH TIME ZONE,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+-- Function to create a subscription record when a tenant is created
+CREATE OR REPLACE FUNCTION public.handle_new_tenant()
+RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO public.subscriptions (tenant_id, plan, status, is_trial)
+  VALUES (NEW.id, NEW.plan, 'trial', TRUE);
   
-  CONSTRAINT valid_role CHECK (role IN ('affiliate'))
-);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Subscriptions Table
-CREATE TABLE IF NOT EXISTS public.subscriptions (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
-  plan TEXT NOT NULL,
-  status TEXT NOT NULL,
-  start_date TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  end_date TIMESTAMP WITH TIME ZONE,
-  is_trial BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  
-  CONSTRAINT valid_plan CHECK (plan IN ('trial', 'starter', 'pro', 'enterprise')),
-  CONSTRAINT valid_status CHECK (status IN ('trial', 'active', 'canceled'))
-);
+-- Trigger for invite acceptance
+CREATE TRIGGER on_invite_accepted
+  BEFORE UPDATE ON public.invites
+  FOR EACH ROW
+  EXECUTE PROCEDURE public.handle_invite_acceptance();
+
+-- Trigger to create a subscription when a tenant is created
+CREATE TRIGGER on_tenant_created
+  AFTER INSERT ON public.tenants
+  FOR EACH ROW
+  EXECUTE PROCEDURE public.handle_new_tenant();
 
 -- Row Level Security Policies
 
--- Enable RLS on all tables but don't force it to ensure service role can bypass
+-- Enable RLS on all tables
 ALTER TABLE public.tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.invites ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.affiliates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.commission_tiers ENABLE ROW LEVEL SECURITY;
 
 -- Drop all policies to ensure a clean state
 DROP POLICY IF EXISTS users_select_policy ON public.users;
@@ -177,10 +275,19 @@ DROP POLICY IF EXISTS subscriptions_select_policy ON public.subscriptions;
 DROP POLICY IF EXISTS subscriptions_insert_policy ON public.subscriptions;
 DROP POLICY IF EXISTS subscriptions_update_policy ON public.subscriptions;
 DROP POLICY IF EXISTS subscriptions_delete_policy ON public.subscriptions;
+DROP POLICY IF EXISTS products_select_policy ON public.products;
+DROP POLICY IF EXISTS products_insert_policy ON public.products;
+DROP POLICY IF EXISTS products_update_policy ON public.products;
+DROP POLICY IF EXISTS products_delete_policy ON public.products;
+DROP POLICY IF EXISTS affiliates_select_policy ON public.affiliates;
+DROP POLICY IF EXISTS affiliates_insert_policy ON public.affiliates;
+DROP POLICY IF EXISTS affiliates_update_policy ON public.affiliates;
+DROP POLICY IF EXISTS affiliates_delete_policy ON public.affiliates;
+DROP POLICY IF EXISTS commission_tiers_select_policy ON public.commission_tiers;
 
 -- Authentication-friendly policies
 
--- Tenants Table Policies - simplified authentication friendly version
+-- Tenants Table Policies
 CREATE POLICY tenants_select_policy ON public.tenants
   FOR SELECT USING (
     auth.uid() IN (
@@ -209,14 +316,12 @@ CREATE POLICY tenants_delete_policy ON public.tenants
     )
   );
 
--- Users Table Policies - critical for authentication
--- Authentication-specific policy
+-- Users Table Policies
 CREATE POLICY users_auth_policy ON public.users
   FOR SELECT USING (
     id = auth.uid()
   );
 
--- Admin access policy
 CREATE POLICY users_admin_policy ON public.users
   FOR ALL USING (
     auth.uid() IN (
@@ -224,7 +329,6 @@ CREATE POLICY users_admin_policy ON public.users
     )
   );
 
--- Self-management policy
 CREATE POLICY users_self_policy ON public.users
   FOR UPDATE USING (
     id = auth.uid()
@@ -292,25 +396,6 @@ CREATE POLICY subscriptions_delete_policy ON public.subscriptions
     )
   );
 
--- Functions and Triggers
-
--- Function to create a subscription record when a tenant is created
-CREATE OR REPLACE FUNCTION public.handle_new_tenant()
-RETURNS TRIGGER AS $$
-BEGIN
-  INSERT INTO public.subscriptions (tenant_id, plan, status, is_trial)
-  VALUES (NEW.id, NEW.plan, 'trial', TRUE);
-  
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Trigger to create a subscription when a tenant is created
-CREATE TRIGGER on_tenant_created
-  AFTER INSERT ON public.tenants
-  FOR EACH ROW
-  EXECUTE PROCEDURE public.handle_new_tenant();
-
 -- Products Table Policies
 CREATE POLICY products_select_policy ON public.products
   FOR SELECT USING (
@@ -340,86 +425,35 @@ CREATE POLICY products_delete_policy ON public.products
     )
   );
 
--- Enable RLS on products table
-ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
+-- Affiliates Table Policies
+CREATE POLICY affiliates_select_policy ON public.affiliates
+  FOR SELECT USING (
+    auth.uid() IN (
+      SELECT id FROM public.users WHERE tenant_id = public.affiliates.tenant_id
+    )
+  );
 
--- Seed initial data (insert tenant, user, then products)
+CREATE POLICY affiliates_insert_policy ON public.affiliates
+  FOR INSERT WITH CHECK (
+    auth.uid() IN (
+      SELECT id FROM public.users WHERE role = 'admin' AND tenant_id = public.affiliates.tenant_id
+    )
+  );
 
--- Insert the tenant
-INSERT INTO public.tenants (
-  id, name, plan, trial_start, trial_end, created_by
-) VALUES (
-  '192c5392-fba1-494b-8d1d-e63e3473c1bf',
-  'Demo Company',
-  'trial',
-  NOW(),
-  NOW() + INTERVAL '14 days',
-  '61d010de-46cd-4112-8f1a-685af2c64f18'
-);
+CREATE POLICY affiliates_update_policy ON public.affiliates
+  FOR UPDATE USING (
+    auth.uid() IN (
+      SELECT id FROM public.users WHERE role = 'admin' AND tenant_id = public.affiliates.tenant_id
+    )
+  );
 
--- Insert the user
-INSERT INTO public.users (
-  id, email, role, tenant_id, created_at
-) VALUES (
-  '61d010de-46cd-4112-8f1a-685af2c64f18',
-  'geervani825@gmail.com',
-  'admin',
-  '192c5392-fba1-494b-8d1d-e63e3473c1bf',
-  NOW()
-);
+CREATE POLICY affiliates_delete_policy ON public.affiliates
+  FOR DELETE USING (
+    auth.uid() IN (
+      SELECT id FROM public.users WHERE role = 'admin' AND tenant_id = public.affiliates.tenant_id
+    )
+  );
 
--- Insert products
-INSERT INTO public.products (
-  tenant_id,
-  name,
-  description,
-  price,
-  product_commission,
-  image_url,
-  created_by
-) VALUES 
-  (
-    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
-    'Premium Course Bundle',
-    'Complete package of all our premium courses including advanced marketing strategies and business development.',
-    299.99,
-    15.00,
-    'https://example.com/images/premium-bundle.jpg',
-    '61d010de-46cd-4112-8f1a-685af2c64f18'
-  ),
-  (
-    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
-    'Marketing Masterclass',
-    'Learn advanced digital marketing techniques and strategies.',
-    149.99,
-    20.00,
-    'https://example.com/images/marketing-masterclass.jpg',
-    '61d010de-46cd-4112-8f1a-685af2c64f18'
-  ),
-  (
-    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
-    'Business Growth Toolkit',
-    'Essential tools and resources for scaling your business.',
-    199.99,
-    25.00,
-    'https://example.com/images/business-toolkit.jpg',
-    '61d010de-46cd-4112-8f1a-685af2c64f18'
-  ),
-  (
-    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
-    'SEO Optimization Guide',
-    'Comprehensive guide to improve your website''s search engine rankings.',
-    79.99,
-    10.00,
-    'https://example.com/images/seo-guide.jpg',
-    '61d010de-46cd-4112-8f1a-685af2c64f18'
-  ),
-  (
-    '192c5392-fba1-494b-8d1d-e63e3473c1bf',
-    'Social Media Strategy Pack',
-    'Complete social media marketing strategy and content calendar.',
-    129.99,
-    15.00,
-    'https://example.com/images/social-media-pack.jpg',
-    '61d010de-46cd-4112-8f1a-685af2c64f18'
-  ); 
+-- Commission Tiers Table Policies
+CREATE POLICY commission_tiers_select_policy ON public.commission_tiers
+  FOR SELECT USING (true); 

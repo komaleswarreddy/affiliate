@@ -5,6 +5,7 @@ import { authRoutes } from './routes/auth';
 import { tenantRoutes } from './routes/tenants';
 import { userRoutes } from './routes/users';
 import { productRoutes } from './routes/products';
+import { affiliateRoutes } from './routes/affiliates';
 import { config } from './config';
 
 const server = Fastify({
@@ -29,6 +30,7 @@ server.register(authRoutes, { prefix: '/api/auth' });
 server.register(tenantRoutes, { prefix: '/api/tenants' });
 server.register(userRoutes, { prefix: '/api/users' });
 server.register(productRoutes, { prefix: '/api' });
+server.register(affiliateRoutes, { prefix: '/api/affiliates' });
 
 // Health check route
 server.get('/health', async () => {

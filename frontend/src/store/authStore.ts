@@ -21,7 +21,7 @@ export interface AuthState {
   token: string | null;
   
   // Methods
-  loginWithEmail: (email: string, password: string) => Promise<{ error: Error | null }>;
+  loginWithEmail: (email: string, password: string) => Promise<{ error: Error | null; user: User | null }>;
   signupWithEmail: (
     email: string, 
     password: string, 
@@ -75,10 +75,10 @@ export const useAuthStore = create<AuthState>()(
 
           await get().getTenantDetails();
 
-          return { error: null };
+          return { error: null, user: data.user };
         } catch (error) {
           set({ isLoading: false });
-          return { error: error as Error };
+          return { error: error as Error, user: null };
         }
       },
 

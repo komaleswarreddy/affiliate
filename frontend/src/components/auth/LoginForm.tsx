@@ -38,15 +38,19 @@ export function LoginForm() {
     setServerError(null);
 
     try {
-      const { error } = await loginWithEmail(data.email, data.password);
+      const { error, user } = await loginWithEmail(data.email, data.password);
 
       if (error) {
         setServerError('Invalid email or password');
         return;
       }
 
-      // Redirect to dashboard on successful login
-      navigate('/dashboard');
+      // Use the user object returned from loginWithEmail for redirect
+      if (user?.role === 'affiliate') {
+        navigate('/affiliate-dashboard');
+      } else {
+        navigate('/dashboard');
+      }
     } catch (err) {
       console.error('Login error:', err);
       setServerError('An unexpected error occurred. Please try again.');

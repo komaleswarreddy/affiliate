@@ -1,10 +1,3 @@
-export interface JWTPayload {
-  id: string;
-  email: string;
-  role: string;
-  tenantId: string;
-}
-
 export interface User {
   id: string;
   email: string;
@@ -62,16 +55,5 @@ export interface Invite {
   created_by: string;
   status: string;
   accepted_at?: string;
-  created_at: string;
-}
-
-export interface Subscription {
-  id: string;
-  tenant_id: string;
-  plan: 'trial' | 'starter' | 'pro' | 'enterprise';
-  status: 'trial' | 'active' | 'canceled';
-  start_date: string;
-  end_date: string | null;
-  is_trial: boolean;
   created_at: string;
 } 

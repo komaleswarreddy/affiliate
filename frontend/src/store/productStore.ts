@@ -40,6 +40,7 @@ export const useProductStore = create<ProductState>((set, get) => ({
     set({ isLoading: true, error: null });
 
     try {
+      console.log(API_URL);
       const response = await fetch(`${API_URL}/products`, {
         headers: {
           'Authorization': `Bearer ${token}`,

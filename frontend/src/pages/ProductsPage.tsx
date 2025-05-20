@@ -1,6 +1,7 @@
 import { ProductList } from '../components/products/ProductList';
 
 export function ProductsPage() {
+console.log("hi");
   return (
     <div className="container mx-auto px-4 py-8">
       <div className="mb-8">

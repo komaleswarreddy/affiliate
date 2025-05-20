@@ -4,6 +4,7 @@ import { useAuthStore } from '../../store/authStore';
 import { ProductForm } from './ProductForm';
 
 export function ProductList() {
+  console.log("pl");
   const { products, isLoading, error, fetchProducts, deleteProduct } = useProductStore();
   const { role } = useAuthStore();
   const isAdmin = role === 'admin';
