@@ -11,7 +11,7 @@ import { config } from './config';
 const server = Fastify({
   logger: true,
 });
-
+ 
 // Register plugins
 server.register(cors, {
   origin: true, // Allow all origins in development
