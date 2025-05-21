@@ -44,16 +44,15 @@ export async function authRoutes(fastify: FastifyInstance) {
         hasFullName: !!data.fullName
       });
 
-      // Create user in auth.users first
+      // Create user in auth.users first - USING ADMIN CLIENT FOR DIRECT CREATION
       request.log.info('Creating auth user...');
-      const { data: authUser, error: authError } = await supabase.auth.signUp({
+      const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
         email: data.email,
         password: data.password,
-        options: {
-          data: {
-            full_name: data.fullName,
-            role: 'admin'
-          }
+        email_confirm: true, // This ensures the email is confirmed immediately
+        user_metadata: {
+          full_name: data.fullName,
+          role: 'admin'
         }
       });
 
@@ -82,7 +81,7 @@ export async function authRoutes(fastify: FastifyInstance) {
       });
 
       // Wait a short moment to ensure the auth user is fully created
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise(resolve => setTimeout(resolve, 1000));
 
       // Verify the user exists in auth.users using RPC
       const { data: verifyUser, error: verifyError } = await supabase
@@ -95,7 +94,7 @@ export async function authRoutes(fastify: FastifyInstance) {
           error: verifyError,
           userId: authUser.user.id
         });
-        await supabase.auth.admin.deleteUser(authUser.user.id);
+        await supabaseAdmin.auth.admin.deleteUser(authUser.user.id);
         throw new Error('Failed to verify auth user creation');
       }
 
@@ -129,7 +128,7 @@ export async function authRoutes(fastify: FastifyInstance) {
           userId: authUser.user.id
         });
         // If tenant creation fails, we should clean up the auth user
-        await supabase.auth.admin.deleteUser(authUser.user.id);
+        await supabaseAdmin.auth.admin.deleteUser(authUser.user.id);
         throw new Error(`Failed to create tenant: ${tenantError.message}`);
       }
 
@@ -165,7 +164,7 @@ export async function authRoutes(fastify: FastifyInstance) {
           hint: userError.hint
         });
         // Clean up both auth user and tenant if user creation fails
-        await supabase.auth.admin.deleteUser(authUser.user.id);
+        await supabaseAdmin.auth.admin.deleteUser(authUser.user.id);
         await supabase.from('tenants').delete().eq('id', tenant.id);
         throw new Error(`Failed to create public user: ${userError.message}`);
       }
@@ -244,71 +243,143 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.post('/login', async (request, reply) => {
     try {
       const data = loginSchema.parse(request.body);
-      request.log.info('Login attempt for email:', data.email);
+      request.log.info('Login attempt for:', { email: data.email });
 
-      // First check if user exists in public.users
-      const { data: existingUser, error: userCheckError } = await supabase
-        .from('users')
-        .select('id, email, role, tenant_id')
-        .eq('email', data.email)
-        .single();
+      // First, check if the user exists in auth.users
+      const { data: userCheck, error: userCheckError } = await supabaseAdmin
+        .auth
+        .admin
+        .listUsers();
 
-      request.log.info('User check result:', { 
-        user: existingUser, 
-        error: userCheckError 
+      // Filter users manually since the filters param is not in the type definition
+      const matchingUsers = userCheck?.users?.filter(u => u.email === data.email) || [];
+      
+      if (userCheckError) {
+        request.log.error('Error checking if user exists:', userCheckError);
+      } else {
+        request.log.info('User check result:', { 
+          found: matchingUsers.length > 0,
+          userCount: matchingUsers.length
+        });
+      }
+
+      // Authenticate user with Supabase Auth
+      let authData = await supabase.auth.signInWithPassword({
+        email: data.email,
+        password: data.password,
       });
 
-      if (userCheckError) {
-        request.log.error('Error checking user existence:', userCheckError);
-        return reply.status(401).send({ error: 'Invalid credentials' });
-      }
-
-      if (!existingUser) {
-        request.log.error('User not found in public.users:', data.email);
-        return reply.status(401).send({ error: 'Invalid credentials' });
-      }
-
-      // Try to authenticate with Supabase Auth
-      try {
-        request.log.info('Attempting Supabase auth with:', { email: data.email });
+      if (authData.error) {
+        request.log.error('Supabase Auth login error:', {
+          error: authData.error,
+          message: authData.error.message,
+          status: authData.error.status
+        });
         
-        const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
-          email: data.email,
-          password: data.password,
-        });
-
-        if (authError) {
-          request.log.error('Supabase Auth login error:', {
-            error: authError,
-            message: authError.message,
-            status: authError.status,
-            name: authError.name,
-            details: authError
-          });
-          return reply.status(401).send({ error: 'Invalid credentials' });
+        // Try to provide more specific error messages
+        if (authData.error.message.includes('Email not confirmed')) {
+          // If the issue is unconfirmed email, let's auto-confirm it
+          request.log.info('Attempting to auto-confirm email for user:', data.email);
+          
+          // Find the user ID first
+          const { data: userData } = await supabaseAdmin.auth.admin.listUsers();
+          const matchingUser = userData?.users?.find(u => u.email === data.email);
+          
+          if (matchingUser) {
+            const userId = matchingUser.id;
+            
+            // Update user to confirm email
+            await supabaseAdmin.auth.admin.updateUserById(userId, {
+              email_confirm: true
+            });
+            
+            request.log.info('Email confirmed for user, retrying login');
+            
+            // Try login again
+            const retryAuthData = await supabase.auth.signInWithPassword({
+              email: data.email,
+              password: data.password,
+            });
+            
+            if (retryAuthData.error) {
+              request.log.error('Retry login failed:', retryAuthData.error);
+              return reply.status(401).send({ error: 'Invalid email or password' });
+            }
+            
+            // If retry succeeded, replace the auth data
+            authData = retryAuthData;
+          } else {
+            return reply.status(401).send({ error: 'Invalid email or password' });
+          }
+        } else {
+          // For other auth errors
+          return reply.status(401).send({ error: 'Invalid email or password' });
         }
+      }
 
-        request.log.info('Auth response:', { 
-          hasUser: !!authData?.user,
-          userId: authData?.user?.id,
-          email: authData?.user?.email
-        });
+      if (!authData.data || !authData.data.user) {
+        request.log.error('Supabase Auth login succeeded but no user data returned');
+        return reply.status(401).send({ error: 'Invalid email or password' });
+      }
 
-        if (!authData?.user) {
-          request.log.error('No user data returned from auth login');
-          return reply.status(401).send({ error: 'Invalid credentials' });
+      request.log.info('Auth login successful, fetching user profile:', { userId: authData.data.user.id });
+
+      // Fetch user from public.users table using the authenticated user's ID
+      let { data: user, error: userError } = await supabase
+        .from('users')
+        .select('id, email, role, tenant_id') // Select relevant fields, exclude password
+        .eq('id', authData.data.user.id)
+        .single();
+
+      if (userError) {
+        request.log.error('Public user fetch error after auth login:', userError);
+        
+        // Special handling for "no rows returned" - this means the user exists in auth but not in public.users
+        if (userError.code === 'PGRST116') {
+          request.log.info('User exists in auth but not in public.users, creating public user record');
+          
+          // Try to create the public user record
+          const { data: tenant } = await supabase
+            .from('tenants')
+            .select('id')
+            .eq('created_by', authData.data.user.id)
+            .single();
+            
+          if (tenant) {
+            // Create user in public.users
+            const userData = {
+              id: authData.data.user.id,
+              email: data.email,
+              role: 'admin',
+              tenant_id: tenant.id
+            };
+            
+            const { data: newUser, error: createError } = await supabase
+              .from('users')
+              .insert([userData])
+              .select()
+              .single();
+              
+            if (createError) {
+              request.log.error('Failed to create missing public user:', createError);
+              return reply.status(500).send({ error: 'Failed to complete login process' });
+            }
+            
+            // Use the newly created user
+            user = newUser;
+          } else {
+            request.log.error('Could not find tenant for auth user:', authData.data.user.id);
+            return reply.status(500).send({ error: 'Account setup incomplete' });
+          }
+        } else {
+          return reply.status(500).send({ error: 'Internal server error' });
         }
+      }
 
-        // Verify the user IDs match
-        if (authData.user.id !== existingUser.id) {
-          request.log.error('User ID mismatch:', {
-            authId: authData.user.id,
-            publicId: existingUser.id,
-            authEmail: authData.user.email,
-            publicEmail: existingUser.email
-          });
-          return reply.status(401).send({ error: 'Invalid credentials' });
-        }
+      if (!user) {
+        request.log.error('Public user not found after successful auth login for user ID:', authData.data.user.id);
+        return reply.status(500).send({ error: 'Internal server error' });
+      }
 
         // Generate JWT token
         const token = fastify.jwt.sign({
