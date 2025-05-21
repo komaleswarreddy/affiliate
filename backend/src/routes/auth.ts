@@ -381,30 +381,22 @@ export async function authRoutes(fastify: FastifyInstance) {
         return reply.status(500).send({ error: 'Internal server error' });
       }
 
-        // Generate JWT token
-        const token = fastify.jwt.sign({
-          id: existingUser.id,
-          email: existingUser.email,
-          role: existingUser.role,
-          tenantId: existingUser.tenant_id,
-        } as JWTPayload);
+      // Generate JWT token
+      const token = fastify.jwt.sign({
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        tenantId: user.tenant_id,
+      } as JWTPayload);
 
-        request.log.info('Login successful:', { 
-          userId: existingUser.id,
-          role: existingUser.role,
-          email: existingUser.email 
-        });
+      request.log.info('Login successful:', { 
+        userId: user.id,
+        role: user.role,
+        email: user.email 
+      });
 
-        // Return token and user data
-        return { token, user: existingUser };
-      } catch (authError) {
-        request.log.error('Authentication error:', {
-          error: authError,
-          message: authError instanceof Error ? authError.message : 'Unknown error',
-          stack: authError instanceof Error ? authError.stack : undefined
-        });
-        return reply.status(401).send({ error: 'Invalid credentials' });
-      }
+      // Return token and user data
+      return { token, user };
     } catch (error) {
       request.log.error('Login error:', {
         error,

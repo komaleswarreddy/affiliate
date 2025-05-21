@@ -4,19 +4,26 @@ import { useAffiliateStore } from '../store/affiliateStore';
 import { Header } from '../components/common/Header';
 
 export function Dashboard() {
-  const { tenant } = useAuthStore();
+  const { tenant, token } = useAuthStore();
   const { affiliates, fetchAffiliates } = useAffiliateStore();
   const [isLoading, setIsLoading] = useState(true);
+  const [pendingCount, setPendingCount] = useState(0);
 
   useEffect(() => {
     const loadData = async () => {
       if (tenant?.id) {
-        await fetchAffiliates(tenant.id);
+        await fetchAffiliates();
+        // Fetch pending invites count from backend
+        const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:3000/api'}/affiliates/pending-invites/count`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json();
+        setPendingCount(data.count || 0);
         setIsLoading(false);
       }
     };
     loadData();
-  }, [tenant?.id, fetchAffiliates]);
+  }, [tenant?.id, fetchAffiliates, token]);
 
   if (isLoading) {
     return (
@@ -47,7 +54,7 @@ export function Dashboard() {
     },
     {
       name: 'Pending Approvals',
-      value: affiliates.filter(a => a.status === 'pending').length,
+      value: pendingCount,
       icon: (
         <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />

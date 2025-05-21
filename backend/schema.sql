@@ -12,6 +12,7 @@ DROP FUNCTION IF EXISTS public.create_tenant CASCADE;
 DROP FUNCTION IF EXISTS public.handle_new_tenant CASCADE;
 DROP FUNCTION IF EXISTS public.verify_auth_user CASCADE;
 DROP FUNCTION IF EXISTS public.handle_invite_acceptance CASCADE;
+DROP FUNCTION IF EXISTS public.generate_tracking_link CASCADE;
 
 -- Enable UUID extension if not already enabled
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -92,6 +93,7 @@ CREATE TABLE IF NOT EXISTS public.affiliates (
   commission_tier_id UUID NOT NULL REFERENCES public.commission_tiers(id),
   total_earnings DECIMAL(10,2) DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'active',
+  tracking_link TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   
@@ -456,4 +458,48 @@ CREATE POLICY affiliates_delete_policy ON public.affiliates
 
 -- Commission Tiers Table Policies
 CREATE POLICY commission_tiers_select_policy ON public.commission_tiers
-  FOR SELECT USING (true); 
+  FOR SELECT USING (true);
+
+-- Function to generate tracking link
+CREATE OR REPLACE FUNCTION public.generate_tracking_link(
+  p_affiliate_id UUID,
+  p_product_id UUID,
+  p_tenant_id UUID
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_affiliate_name TEXT;
+  v_product_name TEXT;
+  v_tracking_link TEXT;
+BEGIN
+  -- Get affiliate name from users table
+  SELECT u.email INTO v_affiliate_name
+  FROM public.users u
+  JOIN public.affiliates a ON a.user_id = u.id
+  WHERE a.id = p_affiliate_id;
+
+  -- Get product name
+  SELECT name INTO v_product_name
+  FROM public.products
+  WHERE id = p_product_id AND tenant_id = p_tenant_id;
+
+  -- Generate tracking link
+  v_tracking_link := format(
+    'https://%s/ref/%s/%s',
+    (SELECT name FROM public.tenants WHERE id = p_tenant_id),
+    v_affiliate_name,
+    v_product_name
+  );
+
+  -- Update affiliate record with tracking link
+  UPDATE public.affiliates
+  SET tracking_link = v_tracking_link
+  WHERE id = p_affiliate_id;
+
+  RETURN v_tracking_link;
+END;
+$$; 

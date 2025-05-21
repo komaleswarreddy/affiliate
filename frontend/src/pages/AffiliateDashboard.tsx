@@ -6,6 +6,7 @@ interface AffiliateDetails {
   id: string;
   status: string;
   total_earnings: number;
+  tracking_link: string;
   commission_tiers: {
     name: string;
     commission_rate: number;
@@ -15,10 +16,20 @@ interface AffiliateDetails {
   };
 }
 
+interface ProductDetails {
+  id: string;
+  name: string;
+  description: string;
+  price: number;
+  product_commission: number;
+  image_url: string;
+}
+
 type SupabaseAffiliateResponse = {
   id: string;
   status: string;
   total_earnings: number;
+  tracking_link: string;
   commission_tiers: {
     name: string;
     commission_rate: number;
@@ -33,18 +44,44 @@ export const AffiliateDashboard: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [affiliateDetails, setAffiliateDetails] = useState<AffiliateDetails | null>(null);
+  const [productDetails, setProductDetails] = useState<ProductDetails | null>(null);
 
   useEffect(() => {
     const fetchAffiliateDetails = async () => {
-      if (!user || !tenant) return;
+      if (!user || !tenant) {
+        console.log('Missing user or tenant:', { user, tenant });
+        return;
+      }
 
       try {
+        console.log('Fetching affiliate details for:', {
+          userId: user.id,
+          tenantId: tenant.id,
+          userEmail: user.email
+        });
+
+        // First check if user exists in public.users
+        const { data: userData, error: userError } = await supabase
+          .from('users')
+          .select('id, email, role, tenant_id')
+          .eq('id', user.id)
+          .single();
+
+        if (userError) {
+          console.error('Error fetching user:', userError);
+          throw new Error('Failed to fetch user details');
+        }
+
+        console.log('Found user:', userData);
+
+        // Then fetch affiliate details
         const { data, error } = await supabase
           .from('affiliates')
           .select(`
             id,
             status,
             total_earnings,
+            tracking_link,
             commission_tiers:commission_tier_id (
               name,
               commission_rate
@@ -57,13 +94,99 @@ export const AffiliateDashboard: React.FC = () => {
           .eq('tenant_id', tenant.id)
           .single();
 
-        if (error) throw error;
-        
-        // Type assertion to ensure data matches our expected structure
-        const typedData = data as unknown as SupabaseAffiliateResponse;
-        setAffiliateDetails(typedData);
+        if (error) {
+          console.error('Error fetching affiliate:', error);
+          if (error.code === 'PGRST116') {
+            // If no affiliate record found, try to create one
+            console.log('No affiliate record found, attempting to create one...');
+            
+            // Get bronze tier
+            const { data: bronzeTier, error: tierError } = await supabase
+              .from('commission_tiers')
+              .select('id')
+              .eq('name', 'Bronze')
+              .single();
+
+            if (tierError) {
+              console.error('Error fetching bronze tier:', tierError);
+              throw new Error('Failed to fetch commission tier');
+            }
+
+            // Create affiliate record
+            const { data: newAffiliate, error: createError } = await supabase
+              .from('affiliates')
+              .insert({
+                user_id: user.id,
+                tenant_id: tenant.id,
+                commission_tier_id: bronzeTier.id,
+                status: 'active'
+              })
+              .select(`
+                id,
+                status,
+                total_earnings,
+                tracking_link,
+                commission_tiers:commission_tier_id (
+                  name,
+                  commission_rate
+                ),
+                users:user_id (
+                  email
+                )
+              `)
+              .single();
+
+            if (createError) {
+              console.error('Error creating affiliate:', createError);
+              throw new Error('Failed to create affiliate record');
+            }
+
+            console.log('Created new affiliate record:', newAffiliate);
+            // Type assertion to ensure data matches our expected structure
+            const typedData = newAffiliate as unknown as SupabaseAffiliateResponse;
+            setAffiliateDetails(typedData);
+          } else {
+            throw error;
+          }
+        } else {
+          console.log('Found affiliate:', data);
+          // Type assertion to ensure data matches our expected structure
+          const typedData = data as unknown as SupabaseAffiliateResponse;
+          setAffiliateDetails(typedData);
+        }
+
+        // Fetch product details from the invite
+        const { data: inviteData, error: inviteError } = await supabase
+          .from('invites')
+          .select('product_id')
+          .eq('email', user.email)
+          .eq('tenant_id', tenant.id)
+          .eq('status', 'accepted')
+          .maybeSingle();
+
+        if (inviteError) {
+          console.error('Error fetching invite:', inviteError);
+          // Don't throw error here, just log it
+        } else if (inviteData?.product_id) {
+          console.log('Found invite:', inviteData);
+          const { data: productData, error: productError } = await supabase
+            .from('products')
+            .select('*')
+            .eq('id', inviteData.product_id)
+            .maybeSingle();
+
+          if (productError) {
+            console.error('Error fetching product:', productError);
+            // Don't throw error here, just log it
+          } else if (productData) {
+            console.log('Found product:', productData);
+            setProductDetails(productData);
+          }
+        } else {
+          console.log('No accepted invite found for this user');
+        }
       } catch (err) {
-        console.error('Error fetching affiliate details:', err);
+        console.error('Error in fetchAffiliateDetails:', err);
         setError('Failed to load affiliate details');
       } finally {
         setLoading(false);
@@ -158,6 +281,58 @@ export const AffiliateDashboard: React.FC = () => {
                 </p>
               </div>
             </div>
+
+            {/* Product Details Card */}
+            {productDetails && (
+              <div className="bg-white rounded-lg shadow p-6">
+                <h2 className="text-lg font-semibold text-gray-900 mb-4">Product Details</h2>
+                <div className="space-y-2">
+                  <p className="text-gray-900 font-medium">{productDetails.name}</p>
+                  <p className="text-gray-600">{productDetails.description}</p>
+                  <p className="text-gray-600">
+                    <span className="font-medium">Price:</span> ${productDetails.price}
+                  </p>
+                  <p className="text-gray-600">
+                    <span className="font-medium">Commission:</span> {productDetails.product_commission}%
+                  </p>
+                  {productDetails.image_url && (
+                    <img 
+                      src={productDetails.image_url} 
+                      alt={productDetails.name}
+                      className="w-full h-48 object-cover rounded-lg mt-2"
+                    />
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Tracking Link Card */}
+            {affiliateDetails.tracking_link && (
+              <div className="bg-white rounded-lg shadow p-6">
+                <h2 className="text-lg font-semibold text-gray-900 mb-4">Your Tracking Link</h2>
+                <div className="space-y-2">
+                  <p className="text-gray-600 break-all">
+                    <span className="font-medium">Link:</span>{' '}
+                    <a 
+                      href={affiliateDetails.tracking_link}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 hover:text-blue-800"
+                    >
+                      {affiliateDetails.tracking_link}
+                    </a>
+                  </p>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(affiliateDetails.tracking_link);
+                    }}
+                    className="mt-2 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+                  >
+                    Copy Link
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

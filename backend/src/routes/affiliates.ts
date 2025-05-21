@@ -35,56 +35,118 @@ export async function affiliateRoutes(fastify: FastifyInstance) {
         .eq('id', inviteId)
         .eq('status', 'pending')
         .single();
+      
+      console.log('Found invite:', invite);
 
       if (inviteError || !invite) {
+        // Check if invite was already accepted
+        const { data: acceptedInvite } = await supabase
+          .from('invites')
+          .select('*')
+          .eq('id', inviteId)
+          .eq('status', 'accepted')
+          .single();
+
+        if (acceptedInvite) {
+          return reply.status(200).send({
+            message: 'Invite was already accepted',
+            email: acceptedInvite.email,
+            isExistingUser: true
+          });
+        }
+
         return reply.status(404).send({ error: 'Invite not found or already processed' });
       }
+
+      // Update invite status first to prevent race conditions
+      const { error: updateError } = await supabase
+        .from('invites')
+        .update({ 
+          status: 'accepted',
+          accepted_at: new Date().toISOString()
+        })
+        .eq('id', inviteId)
+        .eq('status', 'pending');
+
+      if (updateError) {
+        console.error('Error updating invite status:', updateError);
+        return reply.status(500).send({ error: 'Failed to update invite status' });
+      }
+
+      console.log('Successfully updated invite status to accepted');
 
       // Generate a random password for the affiliate
       const randomPassword = Math.random().toString(36).slice(-10);
 
       try {
-        // Try to create the user in Supabase Auth
-        const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
-          email: invite.email,
-          password: randomPassword,
-          email_confirm: true,
-        });
+        // First check if user already exists
+        const { data: existingUsers, error: listError } = await supabaseAdmin.auth.admin.listUsers();
+        if (listError) {
+          console.error('Error listing users:', listError);
+          return reply.status(500).send({ 
+            error: 'Failed to check existing users', 
+            details: listError.message 
+          });
+        }
 
+        const existingUser = existingUsers?.users?.find(u => u.email === invite.email);
         let userId;
-        if (authError && authError.status === 422 && authError.code === 'email_exists') {
-          // User already exists in auth.users, fetch their id
-          const { data: userList, error: fetchUserError } = await supabaseAdmin.auth.admin.listUsers();
-          if (fetchUserError || !userList || !userList.users) {
-            return reply.status(500).send({ error: 'User already exists but could not fetch user id', details: fetchUserError?.message });
-          }
-          const foundUser = userList.users.find(u => u.email === invite.email);
-          if (!foundUser) {
-            return reply.status(500).send({ error: 'User already exists but could not fetch user id', details: 'User not found in list.' });
-          }
-          userId = foundUser.id;
-        } else if (authError) {
-          // Log the error but don't fail if it's just a duplicate user
-          if (authError.code === 'unexpected_failure' && authError.message?.includes('already exists')) {
-            // Try to fetch the existing user
-            const { data: userList, error: fetchUserError } = await supabaseAdmin.auth.admin.listUsers();
-            if (fetchUserError || !userList || !userList.users) {
-              return reply.status(500).send({ error: 'User already exists but could not fetch user id', details: fetchUserError?.message });
-            }
-            const foundUser = userList.users.find(u => u.email === invite.email);
-            if (!foundUser) {
-              return reply.status(500).send({ error: 'User already exists but could not fetch user id', details: 'User not found in list.' });
-            }
-            userId = foundUser.id;
-          } else {
-            console.error('Supabase Admin createUser error:', authError);
-            return reply.status(500).send({ error: 'Failed to create auth user', details: authError?.message });
-          }
+
+        if (existingUser) {
+          console.log('User already exists, using existing ID:', existingUser.id);
+          userId = existingUser.id;
         } else {
-          userId = authUser.user.id;
+          // Create new user with retries
+          let retries = 3;
+          let lastError;
+          
+          while (retries > 0) {
+            try {
+              const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
+                email: invite.email,
+                password: randomPassword,
+                email_confirm: true,
+                user_metadata: {
+                  role: 'affiliate'
+                }
+              });
+
+              if (authError) {
+                lastError = authError;
+                console.error(`Auth user creation attempt ${4-retries} failed:`, authError);
+                retries--;
+                if (retries > 0) {
+                  await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second before retry
+                  continue;
+                }
+                throw authError;
+              }
+
+              userId = authUser.user.id;
+              console.log('Successfully created new auth user:', userId);
+              break;
+            } catch (error) {
+              lastError = error;
+              retries--;
+              if (retries > 0) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                continue;
+              }
+              throw error;
+            }
+          }
+
+          if (!userId) {
+            console.error('All retries failed:', lastError);
+            return reply.status(500).send({ 
+              error: 'Failed to create auth user after multiple attempts', 
+              details: lastError instanceof Error ? lastError.message : 'Unknown error'
+            });
+          }
         }
 
         // Now insert into public.users if not already present
+        console.log('Creating user profile for:', userId);
         const { data: userProfile, error: userProfileError } = await supabase
           .from('users')
           .upsert({
@@ -98,8 +160,19 @@ export async function affiliateRoutes(fastify: FastifyInstance) {
           .single();
 
         if (userProfileError) {
-          return reply.status(500).send({ error: 'Failed to create user profile', details: userProfileError.message });
+          console.error('Error creating user profile:', userProfileError);
+          return reply.status(500).send({ 
+            error: 'Failed to create user profile', 
+            details: userProfileError.message 
+          });
         }
+
+        if (!userProfile || !userProfile.id) {
+          console.error('No user profile returned after creation');
+          return reply.status(500).send({ error: 'Failed to create user profile - no ID returned' });
+        }
+
+        console.log('Successfully created user profile:', userProfile.id);
 
         // Get bronze commission tier
         const { data: bronzeTier } = await supabase
@@ -108,13 +181,18 @@ export async function affiliateRoutes(fastify: FastifyInstance) {
           .eq('name', 'Bronze')
           .single();
 
+        if (!bronzeTier || !bronzeTier.id) {
+          console.error('Failed to get bronze tier');
+          return reply.status(500).send({ error: 'Failed to get commission tier' });
+        }
+
         // Create affiliate record
         const { data: affiliate, error: affiliateError } = await supabase
           .from('affiliates')
           .insert({
             user_id: userProfile.id,
             tenant_id: invite.tenant_id,
-            commission_tier_id: bronzeTier?.id,
+            commission_tier_id: bronzeTier.id,
             status: 'active',
           })
           .select()
@@ -139,12 +217,6 @@ export async function affiliateRoutes(fastify: FastifyInstance) {
               return reply.status(500).send({ error: 'Failed to fetch existing affiliate details' });
             }
 
-            // Update invite status
-            await supabase
-              .from('invites')
-              .update({ status: 'accepted', accepted_at: new Date().toISOString() })
-              .eq('id', inviteId);
-
             // Return success with existing user's email
             return reply.send({
               message: 'Welcome back! You are already an affiliate.',
@@ -155,21 +227,37 @@ export async function affiliateRoutes(fastify: FastifyInstance) {
           return reply.status(500).send({ error: 'Failed to create affiliate record', details: affiliateError.message });
         }
 
-        // Update invite status
-        await supabase
-          .from('invites')
-          .update({ status: 'accepted', accepted_at: new Date().toISOString() })
-          .eq('id', inviteId);
+        if (!affiliate || !affiliate.id) {
+          console.error('No affiliate record returned after creation');
+          return reply.status(500).send({ error: 'Failed to create affiliate record - no ID returned' });
+        }
+
+        // Generate tracking link
+        const { data: trackingLink, error: trackingError } = await supabase
+          .rpc('generate_tracking_link', {
+            p_affiliate_id: affiliate.id,
+            p_product_id: invite.product_id,
+            p_tenant_id: invite.tenant_id
+          });
+
+        if (trackingError) {
+          console.error('Error generating tracking link:', trackingError);
+          // Don't fail the request if tracking link generation fails
+        }
 
         // Return credentials as JSON
         return reply.send({
           message: 'Invite accepted successfully',
           email: invite.email,
           password: randomPassword,
+          trackingLink: trackingLink || null
         });
       } catch (error) {
         console.error('Error processing invite:', error);
-        return reply.status(500).send({ error: 'Failed to process invite', details: error instanceof Error ? error.message : 'Unknown error' });
+        return reply.status(500).send({ 
+          error: 'Failed to process invite', 
+          details: error instanceof Error ? error.message : 'Unknown error' 
+        });
       }
     } catch (error) {
       request.log.error(error);
@@ -178,7 +266,7 @@ export async function affiliateRoutes(fastify: FastifyInstance) {
   });
 
   // 2. Auth middleware as a function
-  const requireAuth = async (request, reply) => {
+  const requireAuth = async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const authHeader = request.headers.authorization;
       if (!authHeader) throw new Error('No authorization header');
@@ -336,6 +424,89 @@ export async function affiliateRoutes(fastify: FastifyInstance) {
       if (error) throw error;
 
       return { affiliate };
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  // Get all pending invites for the current tenant
+  fastify.get('/pending-invites', { onRequest: requireAuth }, async (request, reply) => {
+    try {
+      const user = request.user as { tenantId: string };
+      if (!user) return reply.status(401).send({ error: 'Unauthorized' });
+
+      const { data: invites, error } = await supabase
+        .from('invites')
+        .select(`
+          *,
+          products:product_id (
+            name, price, product_commission
+          )
+        `)
+        .eq('tenant_id', user.tenantId)
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      return { invites };
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  // Get count of pending invites for the current tenant
+  fastify.get('/pending-invites/count', { onRequest: requireAuth }, async (request, reply) => {
+    try {
+      const user = request.user as { tenantId: string };
+      if (!user) return reply.status(401).send({ error: 'Unauthorized' });
+
+      const { count, error } = await supabase
+        .from('invites')
+        .select('*', { count: 'exact', head: true })
+        .eq('tenant_id', user.tenantId)
+        .eq('status', 'pending');
+
+      if (error) throw error;
+      return { count: count || 0 };
+    } catch (error) {
+      request.log.error(error);
+      return reply.status(500).send({ error: 'Internal server error' });
+    }
+  });
+
+  // Get all commission tiers and their affiliates for the current tenant
+  fastify.get('/tiers-with-affiliates', { onRequest: requireAuth }, async (request, reply) => {
+    try {
+      const user = request.user as { tenantId: string };
+      if (!user) return reply.status(401).send({ error: 'Unauthorized' });
+
+      // Get all tiers
+      const { data: tiers, error: tiersError } = await supabase
+        .from('commission_tiers')
+        .select('*')
+        .order('commission_rate', { ascending: true });
+      if (tiersError) throw tiersError;
+
+      // Get all affiliates for this tenant, joined with user and tier info
+      const { data: affiliates, error: affiliatesError } = await supabase
+        .from('affiliates')
+        .select(`
+          *,
+          users:user_id (email),
+          commission_tiers:commission_tier_id (name)
+        `)
+        .eq('tenant_id', user.tenantId);
+      if (affiliatesError) throw affiliatesError;
+
+      // Group affiliates by tier
+      const tiersWithAffiliates = tiers.map(tier => ({
+        ...tier,
+        affiliates: affiliates.filter(a => a.commission_tier_id === tier.id)
+      }));
+
+      return { tiers: tiersWithAffiliates };
     } catch (error) {
       request.log.error(error);
       return reply.status(500).send({ error: 'Internal server error' });
