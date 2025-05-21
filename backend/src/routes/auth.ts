@@ -244,55 +244,103 @@ export async function authRoutes(fastify: FastifyInstance) {
   fastify.post('/login', async (request, reply) => {
     try {
       const data = loginSchema.parse(request.body);
+      request.log.info('Login attempt for email:', data.email);
 
-      // Authenticate user with Supabase Auth
-      const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
-        email: data.email,
-        password: data.password,
+      // First check if user exists in public.users
+      const { data: existingUser, error: userCheckError } = await supabase
+        .from('users')
+        .select('id, email, role, tenant_id')
+        .eq('email', data.email)
+        .single();
+
+      request.log.info('User check result:', { 
+        user: existingUser, 
+        error: userCheckError 
       });
 
-      if (authError) {
-        request.log.error('Supabase Auth login error:', authError);
-        // Return 401 for invalid credentials as Supabase Auth errors don't always have a specific status for this
+      if (userCheckError) {
+        request.log.error('Error checking user existence:', userCheckError);
         return reply.status(401).send({ error: 'Invalid credentials' });
       }
 
-      if (!authData.user) {
-         request.log.error('Supabase Auth login succeeded but no user data returned');
-         return reply.status(401).send({ error: 'Invalid credentials' });
+      if (!existingUser) {
+        request.log.error('User not found in public.users:', data.email);
+        return reply.status(401).send({ error: 'Invalid credentials' });
       }
 
-      // Fetch user from public.users table using the authenticated user's ID
-      const { data: user, error: userError } = await supabase
-        .from('users')
-        .select('id, email, role, tenant_id') // Select relevant fields, exclude password
-        .eq('id', authData.user.id)
-        .single();
+      // Try to authenticate with Supabase Auth
+      try {
+        request.log.info('Attempting Supabase auth with:', { email: data.email });
+        
+        const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+          email: data.email,
+          password: data.password,
+        });
 
-      if (userError) {
-        request.log.error('Public user fetch error after auth login:', userError);
-        return reply.status(500).send({ error: 'Internal server error' });
+        if (authError) {
+          request.log.error('Supabase Auth login error:', {
+            error: authError,
+            message: authError.message,
+            status: authError.status,
+            name: authError.name,
+            details: authError
+          });
+          return reply.status(401).send({ error: 'Invalid credentials' });
+        }
+
+        request.log.info('Auth response:', { 
+          hasUser: !!authData?.user,
+          userId: authData?.user?.id,
+          email: authData?.user?.email
+        });
+
+        if (!authData?.user) {
+          request.log.error('No user data returned from auth login');
+          return reply.status(401).send({ error: 'Invalid credentials' });
+        }
+
+        // Verify the user IDs match
+        if (authData.user.id !== existingUser.id) {
+          request.log.error('User ID mismatch:', {
+            authId: authData.user.id,
+            publicId: existingUser.id,
+            authEmail: authData.user.email,
+            publicEmail: existingUser.email
+          });
+          return reply.status(401).send({ error: 'Invalid credentials' });
+        }
+
+        // Generate JWT token
+        const token = fastify.jwt.sign({
+          id: existingUser.id,
+          email: existingUser.email,
+          role: existingUser.role,
+          tenantId: existingUser.tenant_id,
+        } as JWTPayload);
+
+        request.log.info('Login successful:', { 
+          userId: existingUser.id,
+          role: existingUser.role,
+          email: existingUser.email 
+        });
+
+        // Return token and user data
+        return { token, user: existingUser };
+      } catch (authError) {
+        request.log.error('Authentication error:', {
+          error: authError,
+          message: authError instanceof Error ? authError.message : 'Unknown error',
+          stack: authError instanceof Error ? authError.stack : undefined
+        });
+        return reply.status(401).send({ error: 'Invalid credentials' });
       }
-
-      if (!user) {
-         request.log.error('Public user not found after successful auth login for user ID:', authData.user.id);
-         return reply.status(500).send({ error: 'Internal server error' });
-      }
-
-      // Generate JWT token
-      const token = fastify.jwt.sign({
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        tenantId: user.tenant_id,
-      } as JWTPayload);
-
-      request.log.info('Login successful for user:', { userId: user.id });
-
-      // Return token and user data (excluding password)
-      return { token, user };
     } catch (error) {
-      request.log.error('Login error:', error);
+      request.log.error('Login error:', {
+        error,
+        message: error instanceof Error ? error.message : 'Unknown error',
+        stack: error instanceof Error ? error.stack : undefined
+      });
+      
       if (error instanceof z.ZodError) {
         return reply.status(400).send({ error: error.errors });
       }

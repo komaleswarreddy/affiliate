@@ -34,6 +34,8 @@ export function LoginForm() {
   });
 
   const onSubmit = async (data: LoginFormData) => {
+    console.log("login form data", data);
+    console.log('data', data);
     setIsSubmitting(true);
     setServerError(null);
 

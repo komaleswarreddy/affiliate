@@ -51,6 +51,7 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true });
         
         try {
+          console.log('Attempting login for:', email);
           const response = await fetch(`${API_URL}/auth/login`, {
             method: 'POST',
             headers: {
@@ -60,10 +61,27 @@ export const useAuthStore = create<AuthState>()(
           });
 
           const data = await response.json();
+          console.log('Login response:', { 
+            status: response.status, 
+            data,
+            headers: Object.fromEntries(response.headers.entries())
+          });
 
           if (!response.ok) {
+            console.error('Login failed:', data);
             throw new Error(data.error || 'Login failed');
           }
+
+          if (!data.user || !data.token) {
+            console.error('Invalid response data:', data);
+            throw new Error('Invalid response from server');
+          }
+
+          console.log('Setting auth state:', {
+            user: data.user,
+            role: data.user.role,
+            hasToken: !!data.token
+          });
 
           set({ 
             user: data.user,
@@ -77,7 +95,14 @@ export const useAuthStore = create<AuthState>()(
 
           return { error: null, user: data.user };
         } catch (error) {
-          set({ isLoading: false });
+          console.error('Login error:', error);
+          set({ 
+            user: null,
+            role: null,
+            token: null,
+            isAuthenticated: false,
+            isLoading: false 
+          });
           return { error: error as Error, user: null };
         }
       },

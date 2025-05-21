@@ -207,7 +207,7 @@ BEGIN
     INSERT INTO auth.users (email, encrypted_password)
     VALUES (NEW.email, crypt(NEW.email, gen_salt('bf')))
     RETURNING id INTO v_user_id;
-    
+
     -- Create user profile
     INSERT INTO public.users (id, email, role, tenant_id, invited_by)
     VALUES (v_user_id, NEW.email, 'affiliate', NEW.tenant_id, NEW.created_by);
@@ -438,7 +438,7 @@ CREATE POLICY affiliates_insert_policy ON public.affiliates
     auth.uid() IN (
       SELECT id FROM public.users WHERE role = 'admin' AND tenant_id = public.affiliates.tenant_id
     )
-  );
+);
 
 CREATE POLICY affiliates_update_policy ON public.affiliates
   FOR UPDATE USING (
